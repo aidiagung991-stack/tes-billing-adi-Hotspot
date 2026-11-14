@@ -163,7 +163,11 @@ function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage
   }
 
   // 2. Kompatibilitas mundur dengan penanda versi lama & deteksi kerusakan teks
-  if (msg.includes('[Perlu ulang pemutusan sesi]') || /pemutusan sesi aktif.*gagal|sesi aktif gagal diputus/i.test(msg)) {
+  const hasValidV1 = v1Matches.length > 0 && !corrupted;
+  if (
+    msg.includes('[Perlu ulang pemutusan sesi]') ||
+    (!hasValidV1 && /(?<!akun lama )pemutusan sesi aktif(?! akun lama).*gagal|sesi aktif gagal diputus/i.test(msg))
+  ) {
     needsSessionDisconnect = true;
   }
 
@@ -1174,7 +1178,7 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
     );
     const pendingDisconnectNeeded =
       packageChanged ||
-      (isDisabled && existing.status === 'active') ||
+      isDisabled ||
       prevPending.needsSessionDisconnect;
 
     const routerOptions = await getActiveRouterOptions();
@@ -1248,17 +1252,19 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
             }
           } else {
             let stageReached: 'provision' | 'verify' = 'provision';
+            let profileChangedOnRouter = false;
             try {
               // TAHAP 1: Buat atau perbarui akun BARU secara idempotent
+              let provResult;
               if (isHotspot) {
-                await createOrUpdateHotspotUser(routerOptions, {
+                provResult = await createOrUpdateHotspotUser(routerOptions, {
                   username: cleanUsername,
                   password: rawPasswordForRouter || undefined,
                   profile: cleanProfile,
                   disabled: isDisabled,
                 });
               } else {
-                await createOrUpdatePppoeSecret(routerOptions, {
+                provResult = await createOrUpdatePppoeSecret(routerOptions, {
                   username: cleanUsername,
                   password: rawPasswordForRouter || undefined,
                   profile: cleanProfile,
@@ -1266,6 +1272,8 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                   disabled: isDisabled,
                 });
               }
+              profileChangedOnRouter = Boolean(provResult.profileChanged);
+              const effectiveDisconnectNeeded = pendingDisconnectNeeded || profileChangedOnRouter;
 
               // TAHAP 2: Verifikasi akun BARU benar-benar tunggal & sesuai di RouterOS SEBELUM menyentuh akun lama
               stageReached = 'verify';
@@ -1288,10 +1296,10 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                 }
               }
 
-              // TAHAP 4: Putuskan SELURUH sesi aktif akun target jika paket berubah, status dinonaktifkan, atau ada pending disconnect
+              // TAHAP 4: Putuskan SELURUH sesi aktif akun target hanya jika ada alasan operasional (paket/profile berubah, nonaktif, atau pending disconnect)
               let sessionDisconnectFailed = false;
               let sessionDisconnectError = '';
-              if (pendingDisconnectNeeded) {
+              if (effectiveDisconnectNeeded) {
                 try {
                   const dcRes = isHotspot
                     ? await disconnectHotspotSession(routerOptions, cleanUsername)
@@ -1348,7 +1356,7 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                   if (accountIdentityChanged || pendingOldAccounts.length > 0) {
                     syncDetails.push('akun lama dihapus & seluruh sesi aktif akun lama diputus');
                   }
-                  if (pendingDisconnectNeeded) {
+                  if (effectiveDisconnectNeeded) {
                     syncDetails.push('seluruh sesi aktif diputus untuk menerapkan profile/status terbaru');
                   }
                   const syncMsg = `Akun '${cleanUsername}' (${targetType.toUpperCase()}) berhasil dibuat/diperbarui & diverifikasi di router MikroTik${
@@ -1364,6 +1372,7 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                 }
               }
             } catch (stageErr: any) {
+              const effectivePendingDisconnect = pendingDisconnectNeeded || profileChangedOnRouter;
               const stageLabel =
                 stageReached === 'verify'
                   ? `Tahap verifikasi akun baru '${cleanUsername}' gagal (akun lama tetap dipertahankan)`
@@ -1371,14 +1380,14 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
               const errMsg = appendPendingMarkers(
                 `${stageLabel}: ${stageErr?.message || 'Error'}`,
                 {
-                  needsSessionDisconnect: pendingDisconnectNeeded,
+                  needsSessionDisconnect: effectivePendingDisconnect,
                   oldAccounts: pendingOldAccounts,
                   corrupted: prevPending.corrupted,
                   stages: {
                     accountProvisioned: stageReached === 'verify',
                     accountVerified: false,
                     oldAccountsPending: pendingOldAccounts.length,
-                    sessionDisconnectPending: pendingDisconnectNeeded,
+                    sessionDisconnectPending: effectivePendingDisconnect,
                   },
                 }
               );
@@ -1830,6 +1839,10 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       });
     }
 
+    if (provResult.profileChanged) {
+      prevPending.needsSessionDisconnect = true;
+    }
+
     // TAHAP 2: Verifikasi akun tunggal benar-benar ada & sesuai (profile + status disabled) di RouterOS
     const verifyRes = isHotspot
       ? await verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
@@ -1849,23 +1862,30 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       }
     }
 
-    // TAHAP 4: Selalu periksa & putuskan seluruh sesi aktif yang relevan setelah provisioning berhasil
+    // TAHAP 4: Putuskan sesi aktif hanya jika ada alasan operasional yang jelas:
+    // (a) needsSessionDisconnect dari penanda tertunda, (b) status isolated/inactive, atau (c) perubahan profile terdeteksi
+    const shouldDisconnectTargetSession = needsSessionDisconnect || Boolean(provResult.profileChanged);
     let sessionDisconnectFailed = false;
     let sessionDisconnectError = '';
-    let sessionDisconnectSummary = 'pemeriksaan sesi aktif selesai (tidak ada sesi aktif)';
-    try {
-      const dcRes = isHotspot
-        ? await disconnectHotspotSession(routerOptions, cleanUsername)
-        : await disconnectPppoeSession(routerOptions, cleanUsername);
-      if (!dcRes.success) {
+    let sessionDisconnectSummary = shouldDisconnectTargetSession
+      ? 'pemeriksaan sesi aktif selesai (tidak ada sesi aktif)'
+      : 'sesi aktif pelanggan tidak diputus (pelanggan active tanpa pekerjaan pemutusan sesi tertunda)';
+
+    if (shouldDisconnectTargetSession) {
+      try {
+        const dcRes = isHotspot
+          ? await disconnectHotspotSession(routerOptions, cleanUsername)
+          : await disconnectPppoeSession(routerOptions, cleanUsername);
+        if (!dcRes.success) {
+          sessionDisconnectFailed = true;
+          sessionDisconnectError = dcRes.message;
+        } else if (dcRes.disconnectedCount > 0) {
+          sessionDisconnectSummary = `${dcRes.disconnectedCount} sesi aktif diputus`;
+        }
+      } catch (dcErr: any) {
         sessionDisconnectFailed = true;
-        sessionDisconnectError = dcRes.message;
-      } else if (dcRes.disconnectedCount > 0) {
-        sessionDisconnectSummary = `${dcRes.disconnectedCount} sesi aktif diputus`;
+        sessionDisconnectError = dcErr?.message || 'Gagal memutuskan sesi aktif';
       }
-    } catch (dcErr: any) {
-      sessionDisconnectFailed = true;
-      sessionDisconnectError = dcErr?.message || 'Gagal memutuskan sesi aktif';
     }
 
     if (failedOldAccounts.length > 0 || sessionDisconnectFailed) {

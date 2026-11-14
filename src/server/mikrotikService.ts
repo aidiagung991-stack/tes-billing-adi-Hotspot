@@ -827,7 +827,7 @@ export async function createOrUpdatePppoeSecret(
     ipAddress?: string;
     disabled?: boolean;
   }
-): Promise<{ success: boolean; message: string; action: 'add' | 'set' }> {
+): Promise<{ success: boolean; message: string; action: 'add' | 'set'; profileChanged: boolean }> {
   const cleanUser = data.username.trim();
   const cleanProfile = data.profile ? data.profile.trim() : '';
 
@@ -856,6 +856,9 @@ export async function createOrUpdatePppoeSecret(
       if (!existingId) {
         throw new Error(`Secret PPPoE '${cleanUser}' ditemukan tanpa atribut .id RouterOS yang valid.`);
       }
+      const previousProfile =
+        matches[0].find((w) => w.startsWith('=profile='))?.replace('=profile=', '').trim() || '';
+      const profileChanged = Boolean(previousProfile && previousProfile !== cleanProfile);
 
       // UPDATE (SET)
       const cleanId = existingId.startsWith('*') ? existingId : `*${existingId}`;
@@ -877,6 +880,7 @@ export async function createOrUpdatePppoeSecret(
         success: true,
         message: `Secret PPPoE '${cleanUser}' berhasil diperbarui di router MikroTik.`,
         action: 'set',
+        profileChanged,
       };
     } else {
       // TAMBAH BARU (ADD)
@@ -904,6 +908,7 @@ export async function createOrUpdatePppoeSecret(
         success: true,
         message: `Secret PPPoE '${cleanUser}' berhasil dibuat di router MikroTik.`,
         action: 'add',
+        profileChanged: false,
       };
     }
   });
@@ -1104,7 +1109,7 @@ export async function createOrUpdateHotspotUser(
     profile: string;
     disabled?: boolean;
   }
-): Promise<{ success: boolean; message: string; action: 'add' | 'set' }> {
+): Promise<{ success: boolean; message: string; action: 'add' | 'set'; profileChanged: boolean }> {
   const cleanUser = data.username.trim();
   const cleanProfile = data.profile ? data.profile.trim() : '';
 
@@ -1132,6 +1137,9 @@ export async function createOrUpdateHotspotUser(
       if (!existingId) {
         throw new Error(`User Hotspot '${cleanUser}' ditemukan tanpa atribut .id RouterOS yang valid.`);
       }
+      const previousProfile =
+        matches[0].find((w) => w.startsWith('=profile='))?.replace('=profile=', '').trim() || '';
+      const profileChanged = Boolean(previousProfile && previousProfile !== cleanProfile);
 
       const cleanId = existingId.startsWith('*') ? existingId : `*${existingId}`;
       const setCmd = ['/ip/hotspot/user/set', `=.id=${cleanId}`, `=profile=${cleanProfile}`];
@@ -1149,6 +1157,7 @@ export async function createOrUpdateHotspotUser(
         success: true,
         message: `User Hotspot '${cleanUser}' berhasil diperbarui di router MikroTik.`,
         action: 'set',
+        profileChanged,
       };
     } else {
       if (!data.password || !data.password.trim()) {
@@ -1171,6 +1180,7 @@ export async function createOrUpdateHotspotUser(
         success: true,
         message: `User Hotspot '${cleanUser}' berhasil dibuat di router MikroTik.`,
         action: 'add',
+        profileChanged: false,
       };
     }
   });

@@ -1286,6 +1286,282 @@ async function main() {
     assert.equal(mockRouter.pppoeActives.length, 0);
   });
 
+  // Skenario 18: Pelanggan active tanpa pekerjaan pemutusan sesi tertunda -> retry TIDAK memutus sesi aktif (PPPoE & Hotspot)
+  await runScenario(18, 'Retry pelanggan active tanpa pekerjaan tertunda TIDAK memutus sesi aktif PPPoE maupun Hotspot', async () => {
+    await api('POST', '/customers', {
+      id: 'c-18a',
+      name: 'Sari Active PPPoE',
+      phone: '081801',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sari18',
+      password: 'Password18A',
+      status: 'active',
+    });
+    await api('POST', '/customers', {
+      id: 'c-18b',
+      name: 'Tono Active Hotspot',
+      phone: '081802',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'hotspot',
+      username: 'tono18',
+      password: 'Password18B',
+      status: 'active',
+    });
+
+    // Pasang sesi aktif yang sedang dipakai pelanggan
+    mockRouter.pppoeActives.push({ '.id': '*ACT_18A', name: 'sari18' });
+    mockRouter.hotspotActives.push({ '.id': '*ACT_18B', user: 'tono18' });
+    mockRouter.commandLog = [];
+
+    // Retry saat status synced & active -> TIDAK boleh memutus sesi
+    const retryPppoe = await api('POST', '/customers/c-18a/sync-router');
+    assert.equal(retryPppoe.status, 200);
+    assert.equal(retryPppoe.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 1, 'Sesi aktif PPPoE pelanggan active tidak boleh diputus!');
+    assert.equal(
+      mockRouter.commandLog.some((cmd) => cmd[0] === '/ppp/active/remove' || cmd[0] === '/ppp/active/print'),
+      false,
+      'Perintah pemutusan sesi PPPoE tidak boleh dipanggil saat tidak ada alasan operasional!'
+    );
+
+    const retryHs = await api('POST', '/customers/c-18b/sync-router');
+    assert.equal(retryHs.status, 200);
+    assert.equal(retryHs.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.hotspotActives.length, 1, 'Sesi aktif Hotspot pelanggan active tidak boleh diputus!');
+    assert.equal(
+      mockRouter.commandLog.some((cmd) => cmd[0] === '/ip/hotspot/active/remove' || cmd[0] === '/ip/hotspot/active/print'),
+      false,
+      'Perintah pemutusan sesi Hotspot tidak boleh dipanggil saat tidak ada alasan operasional!'
+    );
+
+    // Simulasikan edit billing (nama saja, router sempat offline -> failed tanpa needsSessionDisconnect) lalu retry saat router online -> tetap tidak memutus sesi!
+    mockRouter.offline = true;
+    const updOffline = await api('PUT', '/customers/c-18a', { name: 'Sari Renamed' });
+    assert.equal(updOffline.json.data.routerSyncStatus, 'failed');
+    mockRouter.offline = false;
+    mockRouter.commandLog = [];
+
+    const retryAfterOffline = await api('POST', '/customers/c-18a/sync-router');
+    assert.equal(retryAfterOffline.status, 200);
+    assert.equal(retryAfterOffline.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 1, 'Retry pasca offline edit non-profile tidak boleh memutus sesi aktif!');
+    assert.equal(mockRouter.commandLog.some((cmd) => cmd[0] === '/ppp/active/remove'), false);
+    assertNoPlaintextLeak(retryPppoe.rawText + retryAfterOffline.rawText, dbStore.customers.get('c-18a'), 'Password18A');
+  });
+
+  // Skenario 19: Pelanggan active DENGAN penanda pemutusan sesi tertunda -> retry MEMUTUS sesi
+  await runScenario(19, 'Retry pelanggan active dengan needsSessionDisconnect tertunda WAJIB memutus sesi aktif', async () => {
+    await api('POST', '/customers', {
+      id: 'c-19',
+      name: 'Umar Pending DC',
+      phone: '0819',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'umar19',
+      password: 'Password19',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*ACT_19', name: 'umar19' });
+
+    const payload = Buffer.from(
+      JSON.stringify({ v: 1, needsSessionDisconnect: true, oldAccounts: [] }),
+      'utf8'
+    ).toString('base64url');
+    const row = dbStore.customers.get('c-19')!;
+    row.router_sync_status = 'failed';
+    row.router_last_sync_message = `Menunggu pemutusan sesi tertunda. [SYNC_META_V1:${payload}]`;
+
+    const retry = await api('POST', '/customers/c-19/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 0, 'Sesi aktif wajib diputus karena ada needsSessionDisconnect tertunda!');
+  });
+
+  // Skenario 20: Pelanggan isolated dan inactive -> retry memastikan seluruh sesi aktif terputus
+  await runScenario(20, 'Retry pelanggan isolated maupun inactive WAJIB memutus seluruh sesi aktifnya', async () => {
+    await api('POST', '/customers', {
+      id: 'c-20a',
+      name: 'Vina Isolated',
+      phone: '082001',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'vina20',
+      password: 'Password20A',
+      status: 'isolated',
+    });
+    await api('POST', '/customers', {
+      id: 'c-20b',
+      name: 'Wawan Inactive',
+      phone: '082002',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'hotspot',
+      username: 'wawan20',
+      password: 'Password20B',
+      status: 'inactive',
+    });
+
+    // Anggap masih ada sesi aktif nyangkut di router
+    mockRouter.pppoeActives.push({ '.id': '*ISO1', name: 'vina20' }, { '.id': '*ISO2', name: 'vina20' });
+    mockRouter.hotspotActives.push({ '.id': '*INACT1', user: 'wawan20' });
+
+    const retryIso = await api('POST', '/customers/c-20a/sync-router');
+    assert.equal(retryIso.status, 200);
+    assert.equal(retryIso.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 0);
+    assert.equal(mockRouter.pppoeSecrets[0].disabled, 'true');
+
+    const retryInact = await api('POST', '/customers/c-20b/sync-router');
+    assert.equal(retryInact.status, 200);
+    assert.equal(retryInact.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.hotspotActives.length, 0);
+    assert.equal(mockRouter.hotspotUsers[0].disabled, 'true');
+  });
+
+  // Skenario 21: Pemutusan sesi saat retry gagal -> status tetap failed & penanda tersimpan -> retry berikutnya tuntas tanpa akun duplikat
+  await runScenario(21, 'Retry gagal putus sesi -> failed + penanda tersimpan -> retry berikutnya tuntas tanpa akun duplikat', async () => {
+    await api('POST', '/customers', {
+      id: 'c-21',
+      name: 'Xena Retry Loop',
+      phone: '0821',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'xena21',
+      password: 'Password21',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*X1', name: 'xena21' });
+    mockRouter.failRemoveIds.add('*X1');
+
+    // Simulasikan package update gagal putus sesi
+    const upd = await api('PUT', '/customers/c-21', { packageId: 'pkg-20m', packageName: 'Paket 20 Mbps' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+
+    // Retry ke-1 masih gagal putus sesi -> status tetap failed, penanda needsSessionDisconnect tetap ada
+    const retry1 = await api('POST', '/customers/c-21/sync-router');
+    assert.equal(retry1.status, 502);
+    assert.equal(retry1.json.data.routerSyncStatus, 'failed');
+    const meta1 = decodeV1Meta(retry1.json.data.routerLastSyncMessage);
+    assert.equal(meta1.needsSessionDisconnect, true);
+    assert.equal(mockRouter.pppoeSecrets.length, 1);
+
+    // Retry ke-2 setelah fault hilang -> tuntas synced & tetap hanya 1 akun (tidak duplikat)
+    mockRouter.failRemoveIds.delete('*X1');
+    const retry2 = await api('POST', '/customers/c-21/sync-router');
+    assert.equal(retry2.status, 200);
+    assert.equal(retry2.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 0);
+    assert.equal(mockRouter.pppoeSecrets.length, 1, 'Retry tidak boleh membuat akun duplikat!');
+    assert.equal(mockRouter.pppoeSecrets[0].profile, 'prof-pppoe-20m');
+  });
+
+  // Skenario 22: Pelanggan active dengan perubahan profile paket di router -> retry memutus sesi untuk terapkan profile baru
+  await runScenario(22, 'Retry pelanggan active saat profile di router berbeda dengan paket -> putus sesi agar profile baru aktif', async () => {
+    await api('POST', '/customers', {
+      id: 'c-22',
+      name: 'Yudi Profile Drift',
+      phone: '0822',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'yudi22',
+      password: 'Password22',
+      status: 'active',
+    });
+    // Anggap admin mengubah nama pppoe_profile pada paket dari prof-pppoe-10m menjadi prof-pppoe-20m
+    dbStore.packages.get('pkg-10m')!.pppoe_profile = 'prof-pppoe-20m';
+    mockRouter.pppoeActives.push({ '.id': '*Y22', name: 'yudi22' });
+
+    const retry = await api('POST', '/customers/c-22/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets[0].profile, 'prof-pppoe-20m');
+    assert.equal(mockRouter.pppoeActives.length, 0, 'Sesi harus diputus ketika profile router berubah!');
+  });
+
+  // Skenario 23: Kegagalan DI ANTARA penghapusan akun lama (sukses) dan pemutusan sesi lama (gagal) -> retry selesaikan pemutusan sesi tanpa sentuh tetangga mirip
+  await runScenario(23, 'Akun lama sudah terhapus namun sesi lamanya gagal diputus -> retry tuntas tanpa sentuh username mirip', async () => {
+    // Buat akun pelanggan lain dengan nama mirip untuk uji anti-false-match cleanup
+    mockRouter.pppoeSecrets.push({
+      '.id': '*NEIGHBOR',
+      name: 'zaki_lama_2',
+      password: 'NeighborPass',
+      profile: 'prof-pppoe-10m',
+      disabled: 'false',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*ACT_NEIGHBOR', name: 'zaki_lama_2' });
+
+    await api('POST', '/customers', {
+      id: 'c-23',
+      name: 'Zaki Mid-Fail',
+      phone: '0823',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'zaki_lama',
+      password: 'Password23',
+      status: 'active',
+    });
+    // Sesi aktif milik zaki_lama gagal diputus, sementara akun secret zaki_lama berhasil terhapus
+    mockRouter.pppoeActives.push({ '.id': '*ACT_ZAKI_OLD', name: 'zaki_lama' });
+    mockRouter.failRemoveIds.add('*ACT_ZAKI_OLD');
+
+    const upd = await api('PUT', '/customers/c-23', { username: 'zaki_baru' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'zaki_baru'), true);
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'zaki_lama'), false, 'Secret zaki_lama sudah terhapus pada tahap 1 cleanup');
+    assert.equal(mockRouter.pppoeActives.some((a) => a['.id'] === '*ACT_ZAKI_OLD'), true, 'Sesi lama belum terputus');
+    const meta = decodeV1Meta(upd.json.data.routerLastSyncMessage);
+    assert.deepEqual(meta.oldAccounts, [{ type: 'pppoe', username: 'zaki_lama' }]);
+
+    // Pasang sesi aktif baru di akun target zaki_baru untuk memastikan retry cleanup lama TIDAK memutus akun baru zaki_baru
+    mockRouter.pppoeActives.push({ '.id': '*ACT_ZAKI_NEW', name: 'zaki_baru' });
+    mockRouter.failRemoveIds.delete('*ACT_ZAKI_OLD');
+
+    const retry = await api('POST', '/customers/c-23/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.some((a) => a['.id'] === '*ACT_ZAKI_OLD'), false, 'Sesi akun lama wajib terputus saat retry');
+    assert.equal(mockRouter.pppoeActives.some((a) => a['.id'] === '*ACT_ZAKI_NEW'), true, 'Sesi akun baru active tidak boleh ikut terputus');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'zaki_lama_2'), true, 'Akun mirip milik pelanggan lain tidak boleh disentuh!');
+    assert.equal(mockRouter.pppoeActives.some((a) => a['.id'] === '*ACT_NEIGHBOR'), true, 'Sesi milik pelanggan lain tidak boleh diputus!');
+  });
+
+  // Skenario 24: Re-aktivasi pelanggan isolated -> active melalui PATCH status tanpa memutus sesi tanpa alasan
+  await runScenario(24, 'Re-aktivasi pelanggan isolated -> active via PATCH status tidak memanggil pemutusan sesi tanpa alasan', async () => {
+    await api('POST', '/customers', {
+      id: 'c-24',
+      name: 'Bima Reactivate',
+      phone: '0824',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'bima24',
+      password: 'Password24',
+      status: 'isolated',
+    });
+    assert.equal(mockRouter.pppoeSecrets[0].disabled, 'true');
+
+    // Simulasikan terdapat sesi aktif saat pengaktifan kembali tanpa penanda pending disconnect
+    mockRouter.pppoeActives.push({ '.id': '*ACT_BIMA', name: 'bima24' });
+    mockRouter.commandLog = [];
+
+    const reactivate = await api('PATCH', '/customers/c-24/status', { status: 'active' });
+    assert.equal(reactivate.status, 200);
+    assert.equal(reactivate.json.data.status, 'active');
+    assert.equal(reactivate.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets[0].disabled, 'false');
+    assert.equal(mockRouter.pppoeActives.length, 1);
+    assert.equal(mockRouter.commandLog.some((cmd) => cmd[0] === '/ppp/active/remove'), false);
+    assertNoPlaintextLeak(reactivate.rawText, dbStore.customers.get('c-24'), 'Password24');
+  });
+
   // Restore prototypes & stop servers cleanly
   pg.Pool.prototype.query = origQuery;
   pg.Pool.prototype.connect = origConnect;
