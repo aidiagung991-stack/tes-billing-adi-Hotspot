@@ -44,7 +44,7 @@ interface PendingSyncPayloadV1 {
   stages?: PendingSyncStages;
 }
 
-interface PendingSyncActions {
+export interface PendingSyncActions {
   needsSessionDisconnect: boolean;
   oldAccounts: PendingRouterAccount[];
   corrupted: boolean;
@@ -79,7 +79,7 @@ function stripPendingMarkersFromMessage(message: string): string {
     .trim();
 }
 
-function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage?: string | null): PendingSyncActions {
+export function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage?: string | null): PendingSyncActions {
   if (lastSyncStatus === 'synced') {
     return { needsSessionDisconnect: false, oldAccounts: [], corrupted: false };
   }
@@ -88,6 +88,7 @@ function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage
   let corrupted = false;
   let corruptedReason: string | undefined;
   let stages: PendingSyncStages | undefined;
+  let validV1Count = 0;
   const oldAccounts: PendingRouterAccount[] = [];
   const seen = new Set<string>();
 
@@ -132,16 +133,7 @@ function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage
         corruptedReason = 'Struktur JSON penanda [SYNC_META_V1] tidak valid atau versi tidak dikenali.';
         continue;
       }
-      if (parsed.corrupted === true) {
-        corrupted = true;
-        corruptedReason = 'Status kegagalan sebelumnya menandai penanda sinkronisasi rusak dan butuh pemeriksaan manual.';
-      }
-      if (parsed.needsSessionDisconnect) {
-        needsSessionDisconnect = true;
-      }
-      if (parsed.stages && typeof parsed.stages === 'object') {
-        stages = { ...stages, ...parsed.stages };
-      }
+      let blockEntryInvalid = false;
       for (const item of parsed.oldAccounts) {
         if (
           !item ||
@@ -152,9 +144,22 @@ function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage
         ) {
           corrupted = true;
           corruptedReason = 'Entri akun lama pada penanda [SYNC_META_V1] rusak.';
+          blockEntryInvalid = true;
           continue;
         }
         addOldAcc(item.type, item.username);
+      }
+      if (parsed.corrupted === true) {
+        corrupted = true;
+        corruptedReason = 'Status kegagalan sebelumnya menandai penanda sinkronisasi rusak dan butuh pemeriksaan manual.';
+      } else if (!blockEntryInvalid) {
+        validV1Count++;
+      }
+      if (parsed.needsSessionDisconnect) {
+        needsSessionDisconnect = true;
+      }
+      if (parsed.stages && typeof parsed.stages === 'object') {
+        stages = { ...stages, ...parsed.stages };
       }
     } catch {
       corrupted = true;
@@ -162,30 +167,33 @@ function parsePendingSyncActions(lastSyncStatus?: string | null, lastSyncMessage
     }
   }
 
-  // 2. Kompatibilitas mundur dengan penanda versi lama & deteksi kerusakan teks
-  const hasValidV1 = v1Matches.length > 0 && !corrupted;
-  if (
-    msg.includes('[Perlu ulang pemutusan sesi]') ||
-    (!hasValidV1 && /(?<!akun lama )pemutusan sesi aktif(?! akun lama).*gagal|sesi aktif gagal diputus/i.test(msg))
-  ) {
-    needsSessionDisconnect = true;
-  }
+  // 2. Kompatibilitas mundur dengan penanda versi lama & fallback saat metadata V1 tidak tersedia atau rusak.
+  // Jika metadata SYNC_META_V1 valid dan tidak rusak, metadata V1 adalah satu-satunya sumber kebenaran.
+  const hasValidV1 = validV1Count > 0 && !corrupted;
+  if (!hasValidV1) {
+    if (
+      msg.includes('[Perlu ulang pemutusan sesi]') ||
+      /(?<!akun lama )pemutusan sesi aktif(?! akun lama).*gagal|sesi aktif gagal diputus/i.test(msg)
+    ) {
+      needsSessionDisconnect = true;
+    }
 
-  const hasLegacyCleanupStart = /\[Perlu pembersihan akun lama:/i.test(msg);
-  const legacyMatches = [...msg.matchAll(/\[Perlu pembersihan akun lama:\s*([^\]]*)\]/gi)];
-  if (hasLegacyCleanupStart && legacyMatches.length === 0) {
-    corrupted = true;
-    corruptedReason = 'Penanda lama [Perlu pembersihan akun lama] terpotong.';
-  }
-  for (const blockMatch of legacyMatches) {
-    const entries = blockMatch[1].split(',');
-    for (const rawEntry of entries) {
-      const m = rawEntry.trim().match(/^(pppoe|hotspot):(.+)$/i);
-      if (m && m[2].trim()) {
-        addOldAcc(m[1].toLowerCase() as 'pppoe' | 'hotspot', m[2].trim());
-      } else if (rawEntry.trim()) {
-        corrupted = true;
-        corruptedReason = 'Entri penanda lama tidak dapat dibaca.';
+    const hasLegacyCleanupStart = /\[Perlu pembersihan akun lama:/i.test(msg);
+    const legacyMatches = [...msg.matchAll(/\[Perlu pembersihan akun lama:\s*([^\]]*)\]/gi)];
+    if (hasLegacyCleanupStart && legacyMatches.length === 0) {
+      corrupted = true;
+      corruptedReason = corruptedReason || 'Penanda lama [Perlu pembersihan akun lama] terpotong.';
+    }
+    for (const blockMatch of legacyMatches) {
+      const entries = blockMatch[1].split(',');
+      for (const rawEntry of entries) {
+        const m = rawEntry.trim().match(/^(pppoe|hotspot):(.+)$/i);
+        if (m && m[2].trim()) {
+          addOldAcc(m[1].toLowerCase() as 'pppoe' | 'hotspot', m[2].trim());
+        } else if (rawEntry.trim()) {
+          corrupted = true;
+          corruptedReason = corruptedReason || 'Entri penanda lama tidak dapat dibaca.';
+        }
       }
     }
   }

@@ -691,6 +691,7 @@ async function main() {
     createOrUpdatePppoeSecret,
   } = await import('../mikrotikService.js');
   const dbRoutesModule = await import('../dbRoutes.js');
+  const { parsePendingSyncActions } = dbRoutesModule;
 
   const routerPasswordEnc = encryptMikrotikPassword('router_secret_123');
   dbStore.reset(routerPort, routerPasswordEnc);
@@ -1560,6 +1561,101 @@ async function main() {
     assert.equal(mockRouter.pppoeActives.length, 1);
     assert.equal(mockRouter.commandLog.some((cmd) => cmd[0] === '/ppp/active/remove'), false);
     assertNoPlaintextLeak(reactivate.rawText, dbStore.customers.get('c-24'), 'Password24');
+  });
+
+  // Skenario 25: SYNC_META_V1 valid (needsSessionDisconnect=false) tidak ditimpa penanda legacy [Perlu ulang pemutusan sesi]
+  await runScenario(25, 'Metadata SYNC_META_V1 valid (needsSessionDisconnect=false) tidak ditimpa [Perlu ulang pemutusan sesi] maupun penanda legacy lain', async () => {
+    const b64False = Buffer.from(
+      JSON.stringify({ v: 1, needsSessionDisconnect: false, oldAccounts: [] }),
+      'utf8'
+    ).toString('base64url');
+    const mixedMsg =
+      `Catatan lama: [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:stale_legacy] [SYNC_META_V1:${b64False}]`;
+
+    const parsed = parsePendingSyncActions('failed', mixedMsg);
+    assert.equal(parsed.needsSessionDisconnect, false, 'needsSessionDisconnect dari V1 valid harus tetap false');
+    assert.equal(parsed.oldAccounts.length, 0, 'oldAccounts dari V1 valid tidak boleh ditimpa legacy');
+    assert.equal(parsed.corrupted, false, 'corrupted harus tetap false');
+
+    // Verifikasi end-to-end sync-router tidak memutus sesi pelanggan active ketika metadata V1 menyatakan false
+    await api('POST', '/customers', {
+      id: 'c-25',
+      name: 'Regresi V1 False',
+      phone: '0825',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'regresi25',
+      password: 'Password25',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*ACT_25', name: 'regresi25' });
+    const row = dbStore.customers.get('c-25')!;
+    row.router_sync_status = 'failed';
+    row.router_last_sync_message = mixedMsg;
+    mockRouter.commandLog = [];
+
+    const retry = await api('POST', '/customers/c-25/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 1, 'Sesi aktif tidak boleh diputus saat V1 needsSessionDisconnect=false!');
+    assert.equal(mockRouter.commandLog.some((cmd) => cmd[0] === '/ppp/active/remove'), false);
+  });
+
+  // Skenario 26: SYNC_META_V1 valid (needsSessionDisconnect=true) tetap true tanpa terpengaruh penanda/heuristik legacy
+  await runScenario(26, 'Metadata SYNC_META_V1 valid (needsSessionDisconnect=true) tetap true dan menjaga oldAccounts V1 tanpa intervensi legacy', async () => {
+    const b64True = Buffer.from(
+      JSON.stringify({
+        v: 1,
+        needsSessionDisconnect: true,
+        oldAccounts: [{ type: 'hotspot', username: 'akun_v1' }],
+      }),
+      'utf8'
+    ).toString('base64url');
+    const mixedMsg =
+      `Catatan legacy [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:akun_legacy_abaikan] [SYNC_META_V1:${b64True}]`;
+
+    const parsed = parsePendingSyncActions('failed', mixedMsg);
+    assert.equal(parsed.needsSessionDisconnect, true);
+    assert.equal(parsed.corrupted, false);
+    assert.deepEqual(parsed.oldAccounts, [{ type: 'hotspot', username: 'akun_v1' }]);
+  });
+
+  // Skenario 27: Pesan legacy tanpa SYNC_META_V1 mengandung [Perlu ulang pemutusan sesi] -> needsSessionDisconnect=true
+  await runScenario(27, 'Pesan legacy tanpa SYNC_META_V1 dengan [Perlu ulang pemutusan sesi] menghasilkan needsSessionDisconnect=true', async () => {
+    const legacyMsg = 'Profile berhasil diubah, namun sesi aktif gagal diputus [Perlu ulang pemutusan sesi]';
+    const parsed = parsePendingSyncActions('failed', legacyMsg);
+    assert.equal(parsed.needsSessionDisconnect, true);
+    assert.equal(parsed.corrupted, false);
+  });
+
+  // Skenario 28: Pesan legacy tanpa SYNC_META_V1 dan tanpa indikasi pemutusan sesi -> needsSessionDisconnect=false
+  await runScenario(28, 'Pesan legacy tanpa SYNC_META_V1 dan tanpa indikasi pemutusan sesi menghasilkan needsSessionDisconnect=false', async () => {
+    const legacyCleanMsg = 'Gagal terhubung ke router 192.168.88.1:8728 (ETIMEDOUT).';
+    const parsed = parsePendingSyncActions('failed', legacyCleanMsg);
+    assert.equal(parsed.needsSessionDisconnect, false);
+    assert.equal(parsed.corrupted, false);
+    assert.equal(parsed.oldAccounts.length, 0);
+  });
+
+  // Skenario 29: Metadata SYNC_META_V1 rusak/tidak valid sementara pesan mengandung penanda legacy -> fallback aman & pending action tetap terjaga
+  await runScenario(29, 'Metadata SYNC_META_V1 rusak dengan penanda legacy menggunakan fallback aman tanpa menghilangkan pending action', async () => {
+    const badBase64Msg =
+      'Gagal sinkronisasi [SYNC_META_V1:broken!@#invalid] [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:legacy_old1,hotspot:legacy_old2]';
+    const parsedBadB64 = parsePendingSyncActions('failed', badBase64Msg);
+    assert.equal(parsedBadB64.corrupted, true);
+    assert.equal(parsedBadB64.needsSessionDisconnect, true);
+    assert.deepEqual(parsedBadB64.oldAccounts, [
+      { type: 'pppoe', username: 'legacy_old1' },
+      { type: 'hotspot', username: 'legacy_old2' },
+    ]);
+
+    const truncatedV1Msg =
+      'Gagal terpotong [SYNC_META_V1:eyJ2Ijox [Perlu pembersihan akun lama: pppoe:legacy_trunc]';
+    const parsedTrunc = parsePendingSyncActions('failed', truncatedV1Msg);
+    assert.equal(parsedTrunc.corrupted, true);
+    assert.equal(parsedTrunc.needsSessionDisconnect, true);
+    assert.deepEqual(parsedTrunc.oldAccounts, [{ type: 'pppoe', username: 'legacy_trunc' }]);
   });
 
   // Restore prototypes & stop servers cleanly
