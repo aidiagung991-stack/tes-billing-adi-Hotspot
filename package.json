@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js migrations.js",
     "lint": "tsc --noEmit",
+    "test": "npm run test:mikrotik",
     "test:mikrotik": "tsx src/server/__tests__/mikrotikIntegration.test.ts"
   },
   "dependencies": {
