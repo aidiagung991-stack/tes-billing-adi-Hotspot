@@ -1,0 +1,1302 @@
+import net from 'node:net';
+import http from 'node:http';
+import assert from 'node:assert/strict';
+import express from 'express';
+import pg from 'pg';
+
+// Pastikan env tersedia sebelum modul db/crypto dimuat secara dinamis
+process.env.DB_PASSWORD = process.env.DB_PASSWORD || 'mock_test_db_password';
+process.env.MIKROTIK_ENCRYPTION_KEY = process.env.MIKROTIK_ENCRYPTION_KEY || 'phase1_audit_test_encryption_key_32bytes';
+
+interface MockRouterSecret {
+  '.id': string;
+  name: string;
+  password: string;
+  profile: string;
+  disabled: 'true' | 'false';
+  'remote-address'?: string;
+}
+
+interface MockRouterSession {
+  '.id': string;
+  name?: string;
+  user?: string;
+  address?: string;
+}
+
+interface MockCustomerRow {
+  id: string;
+  name: string;
+  phone: string;
+  address: string;
+  installation_address: string;
+  latitude: number | null;
+  longitude: number | null;
+  package_id: string;
+  package_name: string;
+  type: 'pppoe' | 'hotspot';
+  username: string;
+  password_encrypted: string | null;
+  ip_address: string | null;
+  status: 'active' | 'isolated' | 'inactive';
+  router_sync_status: 'pending' | 'synced' | 'failed';
+  router_last_sync_at: string | null;
+  router_last_sync_message: string | null;
+  registered_at: string;
+  due_date_day: number;
+  monthly_fee: number;
+  installation_date: string | null;
+  is_deleted: boolean;
+  deleted_at: string | null;
+  updated_at: string;
+}
+
+interface MockPackageRow {
+  id: string;
+  name: string;
+  pppoe_profile: string | null;
+  hotspot_profile: string | null;
+  active_users_count: number;
+}
+
+// ============================================================================
+// 1. IN-MEMORY TCP MOCK ROUTEROS API SERVER (NO PHYSICAL MIKROTIK TOUCHED)
+// ============================================================================
+function encodeWord(word: string): Buffer {
+  const wordBuf = Buffer.from(word, 'utf8');
+  const len = wordBuf.length;
+  let lenBuf: Buffer;
+  if (len < 0x80) {
+    lenBuf = Buffer.from([len]);
+  } else if (len < 0x4000) {
+    lenBuf = Buffer.from([(len >> 8) | 0x80, len & 0xff]);
+  } else {
+    lenBuf = Buffer.from([(len >> 16) | 0xc0, (len >> 8) & 0xff, len & 0xff]);
+  }
+  return Buffer.concat([lenBuf, wordBuf]);
+}
+
+function encodeSentence(words: string[]): Buffer {
+  return Buffer.concat([...words.map(encodeWord), Buffer.from([0x00])]);
+}
+
+function decodeLength(buf: Buffer, offset: number): { len: number; bytesRead: number } | null {
+  if (offset >= buf.length) return null;
+  const b0 = buf[offset];
+  if ((b0 & 0x80) === 0) return { len: b0, bytesRead: 1 };
+  if ((b0 & 0xc0) === 0x80) {
+    if (offset + 1 >= buf.length) return null;
+    return { len: ((b0 & ~0x80) << 8) | buf[offset + 1], bytesRead: 2 };
+  }
+  if ((b0 & 0xe0) === 0xc0) {
+    if (offset + 2 >= buf.length) return null;
+    return { len: ((b0 & ~0xe0) << 16) | (buf[offset + 1] << 8) | buf[offset + 2], bytesRead: 3 };
+  }
+  return null;
+}
+
+function extractSentences(buffer: Buffer): { sentences: string[][]; remaining: Buffer } {
+  const sentences: string[][] = [];
+  let currentWords: string[] = [];
+  let offset = 0;
+
+  while (offset < buffer.length) {
+    const lenInfo = decodeLength(buffer, offset);
+    if (!lenInfo) break;
+    offset += lenInfo.bytesRead;
+
+    if (lenInfo.len === 0) {
+      sentences.push(currentWords);
+      currentWords = [];
+      buffer = buffer.subarray(offset);
+      offset = 0;
+      continue;
+    }
+
+    if (offset + lenInfo.len > buffer.length) {
+      offset -= lenInfo.bytesRead;
+      break;
+    }
+
+    currentWords.push(buffer.toString('utf8', offset, offset + lenInfo.len));
+    offset += lenInfo.len;
+  }
+
+  return { sentences, remaining: buffer.subarray(offset) };
+}
+
+class MockRouterOsServer {
+  server: net.Server;
+  port = 0;
+  offline = false;
+
+  pppoeProfiles = new Set<string>(['prof-pppoe-10m', 'prof-pppoe-20m']);
+  hotspotProfiles = new Set<string>(['prof-hs-10m', 'prof-hs-20m']);
+
+  pppoeSecrets: MockRouterSecret[] = [];
+  hotspotUsers: MockRouterSecret[] = [];
+  pppoeActives: MockRouterSession[] = [];
+  hotspotActives: MockRouterSession[] = [];
+
+  commandLog: string[][] = [];
+  trapOnCommand = new Map<string, string>(); // key: commandPath e.g. '/ppp/secret/set'
+  fatalOnCommand = new Map<string, string>();
+  failRemoveIds = new Set<string>(); // e.g. '*S2'
+  lingerAfterRemoveIds = new Set<string>(); // remove succeeds in RouterOS reply but session persists on subsequent /print
+  nextIdCounter = 100;
+
+  constructor() {
+    this.server = net.createServer((socket) => {
+      if (this.offline) {
+        socket.destroy();
+        return;
+      }
+
+      let buf: Buffer = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        const extracted = extractSentences(buf);
+        buf = extracted.remaining;
+
+        for (const words of extracted.sentences) {
+          this.handleSentence(socket, words);
+        }
+      });
+    });
+  }
+
+  async start(): Promise<number> {
+    await new Promise<void>((resolve) => {
+      this.server.listen(0, '127.0.0.1', () => {
+        const addr = this.server.address() as net.AddressInfo;
+        this.port = addr.port;
+        resolve();
+      });
+    });
+    return this.port;
+  }
+
+  async stop(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.server.close(() => resolve());
+    });
+  }
+
+  reset(clearData = true) {
+    this.offline = false;
+    this.commandLog = [];
+    this.trapOnCommand.clear();
+    this.fatalOnCommand.clear();
+    this.failRemoveIds.clear();
+    this.lingerAfterRemoveIds.clear();
+    if (clearData) {
+      this.pppoeProfiles = new Set(['prof-pppoe-10m', 'prof-pppoe-20m']);
+      this.hotspotProfiles = new Set(['prof-hs-10m', 'prof-hs-20m']);
+      this.pppoeSecrets = [];
+      this.hotspotUsers = [];
+      this.pppoeActives = [];
+      this.hotspotActives = [];
+    }
+  }
+
+  private nextId(prefix: string): string {
+    this.nextIdCounter += 1;
+    return `*${prefix}${this.nextIdCounter}`;
+  }
+
+  private parseAttrs(words: string[]): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    for (const w of words.slice(1)) {
+      if (w.startsWith('=')) {
+        const eqIdx = w.indexOf('=', 1);
+        if (eqIdx > 1) {
+          attrs[w.slice(1, eqIdx)] = w.slice(eqIdx + 1);
+        }
+      } else if (w.startsWith('?')) {
+        const eqIdx = w.indexOf('=', 1);
+        if (eqIdx > 1) {
+          attrs[`?${w.slice(1, eqIdx)}`] = w.slice(eqIdx + 1);
+        }
+      }
+    }
+    return attrs;
+  }
+
+  private handleSentence(socket: net.Socket, words: string[]) {
+    if (words.length === 0) return;
+    const cmd = words[0];
+    this.commandLog.push(words);
+
+    if (this.fatalOnCommand.has(cmd)) {
+      const msg = this.fatalOnCommand.get(cmd)!;
+      socket.write(encodeSentence(['!fatal', msg]));
+      socket.end();
+      return;
+    }
+
+    if (this.trapOnCommand.has(cmd)) {
+      const msg = this.trapOnCommand.get(cmd)!;
+      socket.write(encodeSentence(['!trap', `=message=${msg}`]));
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    const attrs = this.parseAttrs(words);
+
+    if (cmd === '/login') {
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ppp/profile/print') {
+      const filterName = attrs['?name'];
+      const names = [...this.pppoeProfiles].filter((n) => (filterName !== undefined ? n === filterName : true));
+      for (const n of names) {
+        socket.write(encodeSentence(['!re', `=name=${n}`]));
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/user/profile/print') {
+      const filterName = attrs['?name'];
+      const names = [...this.hotspotProfiles].filter((n) => (filterName !== undefined ? n === filterName : true));
+      for (const n of names) {
+        socket.write(encodeSentence(['!re', `=name=${n}`]));
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ppp/secret/print') {
+      const filterName = attrs['?name'];
+      const matches = this.pppoeSecrets.filter((s) => (filterName !== undefined ? s.name === filterName : true));
+      for (const s of matches) {
+        socket.write(
+          encodeSentence([
+            '!re',
+            `=.id=${s['.id']}`,
+            `=name=${s.name}`,
+            `=password=${s.password}`,
+            `=profile=${s.profile}`,
+            `=disabled=${s.disabled}`,
+          ])
+        );
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ppp/secret/add') {
+      const newSecret: MockRouterSecret = {
+        '.id': this.nextId('P'),
+        name: attrs.name || '',
+        password: attrs.password || '',
+        profile: attrs.profile || '',
+        disabled: attrs.disabled === 'yes' ? 'true' : 'false',
+        ...(attrs['remote-address'] ? { 'remote-address': attrs['remote-address'] } : {}),
+      };
+      this.pppoeSecrets.push(newSecret);
+      socket.write(encodeSentence(['!done', `=ret=${newSecret['.id']}`]));
+      return;
+    }
+
+    if (cmd === '/ppp/secret/set') {
+      const id = attrs['.id'];
+      const found = this.pppoeSecrets.find((s) => s['.id'] === id);
+      if (!found) {
+        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
+        socket.write(encodeSentence(['!done']));
+        return;
+      }
+      if (attrs.password !== undefined) found.password = attrs.password;
+      if (attrs.profile !== undefined) found.profile = attrs.profile;
+      if (attrs.disabled !== undefined) found.disabled = attrs.disabled === 'yes' ? 'true' : 'false';
+      if (attrs['remote-address'] !== undefined) found['remote-address'] = attrs['remote-address'];
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ppp/secret/remove') {
+      const id = attrs['.id'];
+      if (this.failRemoveIds.has(id)) {
+        socket.write(encodeSentence(['!trap', `=message=injected failure removing secret ${id}`]));
+        socket.write(encodeSentence(['!done']));
+        return;
+      }
+      const before = this.pppoeSecrets.length;
+      this.pppoeSecrets = this.pppoeSecrets.filter((s) => s['.id'] !== id);
+      if (this.pppoeSecrets.length === before) {
+        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/user/print') {
+      const filterName = attrs['?name'];
+      const matches = this.hotspotUsers.filter((s) => (filterName !== undefined ? s.name === filterName : true));
+      for (const s of matches) {
+        socket.write(
+          encodeSentence([
+            '!re',
+            `=.id=${s['.id']}`,
+            `=name=${s.name}`,
+            `=password=${s.password}`,
+            `=profile=${s.profile}`,
+            `=disabled=${s.disabled}`,
+          ])
+        );
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/user/add') {
+      const newUser: MockRouterSecret = {
+        '.id': this.nextId('H'),
+        name: attrs.name || '',
+        password: attrs.password || '',
+        profile: attrs.profile || '',
+        disabled: attrs.disabled === 'yes' ? 'true' : 'false',
+      };
+      this.hotspotUsers.push(newUser);
+      socket.write(encodeSentence(['!done', `=ret=${newUser['.id']}`]));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/user/set') {
+      const id = attrs['.id'];
+      const found = this.hotspotUsers.find((s) => s['.id'] === id);
+      if (!found) {
+        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
+        socket.write(encodeSentence(['!done']));
+        return;
+      }
+      if (attrs.password !== undefined) found.password = attrs.password;
+      if (attrs.profile !== undefined) found.profile = attrs.profile;
+      if (attrs.disabled !== undefined) found.disabled = attrs.disabled === 'yes' ? 'true' : 'false';
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/user/remove') {
+      const id = attrs['.id'];
+      if (this.failRemoveIds.has(id)) {
+        socket.write(encodeSentence(['!trap', `=message=injected failure removing hotspot user ${id}`]));
+        socket.write(encodeSentence(['!done']));
+        return;
+      }
+      const before = this.hotspotUsers.length;
+      this.hotspotUsers = this.hotspotUsers.filter((s) => s['.id'] !== id);
+      if (this.hotspotUsers.length === before) {
+        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ppp/active/print') {
+      const filterName = attrs['?name'];
+      const matches = this.pppoeActives.filter((a) => (filterName !== undefined ? a.name === filterName : true));
+      for (const a of matches) {
+        socket.write(encodeSentence(['!re', `=.id=${a['.id']}`, `=name=${a.name || ''}`, `=address=${a.address || '10.0.0.2'}`]));
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ppp/active/remove') {
+      const id = attrs['.id'];
+      if (this.failRemoveIds.has(id)) {
+        socket.write(encodeSentence(['!trap', `=message=injected failure removing ppp active ${id}`]));
+        socket.write(encodeSentence(['!done']));
+        return;
+      }
+      if (!this.lingerAfterRemoveIds.has(id)) {
+        this.pppoeActives = this.pppoeActives.filter((a) => a['.id'] !== id);
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/active/print') {
+      const filterUser = attrs['?user'];
+      const matches = this.hotspotActives.filter((a) => (filterUser !== undefined ? a.user === filterUser : true));
+      for (const a of matches) {
+        socket.write(encodeSentence(['!re', `=.id=${a['.id']}`, `=user=${a.user || ''}`, `=address=${a.address || '10.5.50.2'}`]));
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    if (cmd === '/ip/hotspot/active/remove') {
+      const id = attrs['.id'];
+      if (this.failRemoveIds.has(id)) {
+        socket.write(encodeSentence(['!trap', `=message=injected failure removing hotspot active ${id}`]));
+        socket.write(encodeSentence(['!done']));
+        return;
+      }
+      if (!this.lingerAfterRemoveIds.has(id)) {
+        this.hotspotActives = this.hotspotActives.filter((a) => a['.id'] !== id);
+      }
+      socket.write(encodeSentence(['!done']));
+      return;
+    }
+
+    socket.write(encodeSentence(['!done']));
+  }
+}
+
+// ============================================================================
+// 2. IN-MEMORY POSTGRESQL MOCK (PATCHES pg.Pool FOR END-TO-END dbRoutes TESTS)
+// ============================================================================
+class MockPostgresStore {
+  routerPort = 8728;
+  routerPasswordEncrypted = '';
+  packages = new Map<string, MockPackageRow>();
+  customers = new Map<string, MockCustomerRow>();
+
+  reset(routerPort: number, routerPasswordEncrypted: string) {
+    this.routerPort = routerPort;
+    this.routerPasswordEncrypted = routerPasswordEncrypted;
+    this.packages.clear();
+    this.customers.clear();
+
+    this.packages.set('pkg-10m', {
+      id: 'pkg-10m',
+      name: 'Paket 10 Mbps',
+      pppoe_profile: 'prof-pppoe-10m',
+      hotspot_profile: 'prof-hs-10m',
+      active_users_count: 0,
+    });
+    this.packages.set('pkg-20m', {
+      id: 'pkg-20m',
+      name: 'Paket 20 Mbps',
+      pppoe_profile: 'prof-pppoe-20m',
+      hotspot_profile: 'prof-hs-20m',
+      active_users_count: 0,
+    });
+    this.packages.set('pkg-missing-prof', {
+      id: 'pkg-missing-prof',
+      name: 'Paket Missing Router Profile',
+      pppoe_profile: 'non-existent-profile',
+      hotspot_profile: 'non-existent-hs-profile',
+      active_users_count: 0,
+    });
+  }
+
+  private mapReturningRow(row: MockCustomerRow) {
+    return {
+      id: row.id,
+      name: row.name,
+      phone: row.phone,
+      address: row.address,
+      installationAddress: row.installation_address,
+      latitude: row.latitude,
+      longitude: row.longitude,
+      packageId: row.package_id,
+      packageName: row.package_name,
+      type: row.type,
+      username: row.username,
+      ipAddress: row.ip_address,
+      status: row.status,
+      routerSyncStatus: row.router_sync_status,
+      routerLastSyncAt: row.router_last_sync_at,
+      routerLastSyncMessage: row.router_last_sync_message,
+      isPasswordConfigured: Boolean(row.password_encrypted && row.password_encrypted !== ''),
+      registeredAt: row.registered_at,
+      dueDateDay: row.due_date_day,
+      monthlyFee: row.monthly_fee,
+      installationDate: row.installation_date,
+    };
+  }
+
+  handleQuery(sql: string, params: any[] = []): { rows: any[]; rowCount: number } {
+    const q = sql.replace(/\s+/g, ' ').trim();
+
+    if (q === 'BEGIN' || q === 'COMMIT' || q === 'ROLLBACK' || q === 'SELECT 1 AS healthcheck') {
+      return { rows: [{ healthcheck: 1 }], rowCount: 1 };
+    }
+
+    if (q.includes('FROM information_schema.columns')) {
+      if (q.includes("table_name = 'customers'")) {
+        return { rows: [{ column_name: 'password_encrypted' }], rowCount: 1 };
+      }
+      if (q.includes("table_name = 'packages'")) {
+        return { rows: [{ column_name: 'pppoe_profile' }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+
+    if (q.includes('FROM mikrotik_settings')) {
+      return {
+        rows: [
+          {
+            host: '127.0.0.1',
+            api_port: this.routerPort,
+            username: 'admin',
+            password_encrypted: this.routerPasswordEncrypted,
+            password_hash: null,
+            use_ssl: false,
+            timeout_seconds: 5,
+          },
+        ],
+        rowCount: 1,
+      };
+    }
+
+    if (q.startsWith('SELECT pppoe_profile, hotspot_profile FROM packages WHERE id = $1')) {
+      const pkg = this.packages.get(params[0]);
+      return { rows: pkg ? [pkg] : [], rowCount: pkg ? 1 : 0 };
+    }
+
+    if (q.startsWith('UPDATE packages p SET active_users_count')) {
+      const pkg = this.packages.get(params[0]);
+      if (pkg) {
+        pkg.active_users_count = [...this.customers.values()].filter(
+          (c) => c.package_id === pkg.id && c.status === 'active' && !c.is_deleted
+        ).length;
+      }
+      return { rows: [], rowCount: pkg ? 1 : 0 };
+    }
+
+    if (q.startsWith('SELECT * FROM customers WHERE id = $1')) {
+      const row = this.customers.get(params[0]);
+      if (!row || (q.includes('is_deleted IS NOT TRUE') && row.is_deleted)) {
+        return { rows: [], rowCount: 0 };
+      }
+      return { rows: [{ ...row }], rowCount: 1 };
+    }
+
+    if (q.startsWith('SELECT router_sync_status, router_last_sync_message FROM customers WHERE id = $1')) {
+      const row = this.customers.get(params[0]);
+      return {
+        rows: row ? [{ router_sync_status: row.router_sync_status, router_last_sync_message: row.router_last_sync_message }] : [],
+        rowCount: row ? 1 : 0,
+      };
+    }
+
+    if (q.startsWith('INSERT INTO customers')) {
+      const nowIso = new Date().toISOString();
+      const row: MockCustomerRow = {
+        id: params[0],
+        name: params[1],
+        phone: params[2],
+        address: params[3],
+        installation_address: params[4],
+        latitude: params[5],
+        longitude: params[6],
+        package_id: params[7],
+        package_name: params[8],
+        type: params[9],
+        username: params[10],
+        password_encrypted: params[11],
+        ip_address: params[12],
+        status: params[13],
+        router_sync_status: params[14],
+        router_last_sync_at: null,
+        router_last_sync_message: params[15],
+        registered_at: params[16],
+        due_date_day: params[17],
+        monthly_fee: params[18],
+        installation_date: params[19],
+        is_deleted: false,
+        deleted_at: null,
+        updated_at: nowIso,
+      };
+      this.customers.set(row.id, row);
+      return { rows: [this.mapReturningRow(row)], rowCount: 1 };
+    }
+
+    if (q.startsWith('UPDATE customers SET router_sync_status =')) {
+      const statusMatch = q.match(/router_sync_status\s*=\s*'(synced|failed|pending)'/);
+      const syncStatus = (statusMatch?.[1] as 'synced' | 'failed' | 'pending') || 'failed';
+      const message = params[0];
+      const id = params[1];
+      const row = this.customers.get(id);
+      if (row) {
+        row.router_sync_status = syncStatus;
+        row.router_last_sync_message = message;
+        row.router_last_sync_at = new Date().toISOString();
+      }
+      return { rows: [], rowCount: row ? 1 : 0 };
+    }
+
+    if (q.startsWith('UPDATE customers SET status = $1')) {
+      const status = params[0];
+      const id = params[1];
+      const row = this.customers.get(id);
+      if (!row) return { rows: [], rowCount: 0 };
+      row.status = status;
+      row.updated_at = new Date().toISOString();
+      return { rows: [this.mapReturningRow(row)], rowCount: 1 };
+    }
+
+    if (q.startsWith('UPDATE customers SET name = COALESCE')) {
+      const id = params[16];
+      const row = this.customers.get(id);
+      if (!row) return { rows: [], rowCount: 0 };
+      if (params[0] != null) row.name = params[0];
+      if (params[1] != null) row.phone = params[1];
+      if (params[2] != null) row.address = params[2];
+      if (params[3] != null) row.installation_address = params[3];
+      if (params[4] != null) row.latitude = params[4];
+      if (params[5] != null) row.longitude = params[5];
+      if (params[6] != null) row.package_id = params[6];
+      if (params[7] != null) row.package_name = params[7];
+      if (params[8] != null) row.type = params[8];
+      if (params[9] != null) row.username = params[9];
+      if (params[10] != null) row.password_encrypted = params[10];
+      if (params[11] != null) row.ip_address = params[11];
+      if (params[12] != null) row.status = params[12];
+      if (params[13] != null) row.due_date_day = params[13];
+      if (params[14] != null) row.monthly_fee = params[14];
+      if (params[15] != null) row.installation_date = params[15];
+      row.updated_at = new Date().toISOString();
+      return { rows: [this.mapReturningRow(row)], rowCount: 1 };
+    }
+
+    throw new Error(`Unhandled SQL in MockPostgresStore: ${q}`);
+  }
+}
+
+// ============================================================================
+// 3. HARNESS & ALL 17+ TEST SCENARIOS
+// ============================================================================
+async function main() {
+  const mockRouter = new MockRouterOsServer();
+  const routerPort = await mockRouter.start();
+
+  const dbStore = new MockPostgresStore();
+
+  // Patch pg.Pool BEFORE importing dbRoutes
+  const origQuery = pg.Pool.prototype.query;
+  const origConnect = pg.Pool.prototype.connect;
+
+  (pg.Pool.prototype as any).query = async function (text: string, params?: any[]) {
+    return dbStore.handleQuery(text, params);
+  };
+  (pg.Pool.prototype as any).connect = async function () {
+    return {
+      query: async (text: string, params?: any[]) => dbStore.handleQuery(text, params),
+      release: () => {},
+    };
+  };
+
+  const { encryptMikrotikPassword } = await import('../cryptoUtils.js');
+  const {
+    disconnectPppoeSession,
+    disconnectHotspotSession,
+    createOrUpdatePppoeSecret,
+  } = await import('../mikrotikService.js');
+  const dbRoutesModule = await import('../dbRoutes.js');
+
+  const routerPasswordEnc = encryptMikrotikPassword('router_secret_123');
+  dbStore.reset(routerPort, routerPasswordEnc);
+
+  const app = express();
+  app.use(express.json());
+  app.use('/api', dbRoutesModule.default);
+
+  const httpServer = http.createServer(app);
+  await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
+  const baseUrl = `http://127.0.0.1:${(httpServer.address() as net.AddressInfo).port}/api`;
+
+  async function api(method: string, path: string, body?: any): Promise<{ status: number; json: any; rawText: string }> {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    const rawText = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(rawText);
+    } catch {
+      // keep null
+    }
+    return { status: res.status, json, rawText };
+  }
+
+  function decodeV1Meta(msg: string | null | undefined): any {
+    if (!msg) return null;
+    const m = msg.match(/\[SYNC_META_V1:([A-Za-z0-9_-]+)\]/);
+    if (!m) return null;
+    return JSON.parse(Buffer.from(m[1], 'base64url').toString('utf8'));
+  }
+
+  function assertNoPlaintextLeak(payloadText: string, dbRow: MockCustomerRow | undefined, secretPwd: string) {
+    assert.ok(!payloadText.includes(secretPwd), 'API response leaked plaintext password!');
+    if (dbRow?.router_last_sync_message) {
+      assert.ok(!dbRow.router_last_sync_message.includes(secretPwd), 'DB sync message leaked plaintext password!');
+    }
+  }
+
+  let passed = 0;
+  let failed = 0;
+
+  async function runScenario(no: number, name: string, fn: () => Promise<void>) {
+    mockRouter.reset(true);
+    dbStore.reset(routerPort, routerPasswordEnc);
+    try {
+      await fn();
+      passed++;
+      console.log(`[PASS] Skenario ${no}: ${name}`);
+    } catch (err: any) {
+      failed++;
+      console.error(`[FAIL] Skenario ${no}: ${name} -> ${err?.message || err}`);
+    }
+  }
+
+  // Skenario 1: Provisioning PPPoE baru berhasil
+  await runScenario(1, 'Provisioning pelanggan PPPoE baru berhasil', async () => {
+    const res = await api('POST', '/customers', {
+      id: 'c-01',
+      name: 'Andi PPPoE',
+      phone: '0811111111',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'andi_pppoe',
+      password: 'SecretPassword123',
+      status: 'active',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.length, 1);
+    assert.equal(mockRouter.pppoeSecrets[0].name, 'andi_pppoe');
+    assert.equal(mockRouter.pppoeSecrets[0].profile, 'prof-pppoe-10m');
+    assert.equal(mockRouter.pppoeSecrets[0].disabled, 'false');
+    assertNoPlaintextLeak(res.rawText, dbStore.customers.get('c-01'), 'SecretPassword123');
+  });
+
+  // Skenario 2: Provisioning Hotspot baru berhasil
+  await runScenario(2, 'Provisioning pelanggan Hotspot baru berhasil', async () => {
+    const res = await api('POST', '/customers', {
+      id: 'c-02',
+      name: 'Budi Hotspot',
+      phone: '0822222222',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'hotspot',
+      username: 'budi_hs',
+      password: 'HotspotPass999',
+      status: 'active',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.hotspotUsers.length, 1);
+    assert.equal(mockRouter.hotspotUsers[0].name, 'budi_hs');
+    assert.equal(mockRouter.hotspotUsers[0].profile, 'prof-hs-10m');
+    assertNoPlaintextLeak(res.rawText, dbStore.customers.get('c-02'), 'HotspotPass999');
+  });
+
+  // Skenario 3: Update paket berhasil mengubah profile dan memutus seluruh sesi aktif
+  await runScenario(3, 'Update paket berhasil ubah profile dan putus seluruh sesi aktif', async () => {
+    await api('POST', '/customers', {
+      id: 'c-03',
+      name: 'Citra',
+      phone: '0833',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'citra03',
+      password: 'Password03',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*A1', name: 'citra03' }, { '.id': '*A2', name: 'citra03' });
+
+    const upd = await api('PUT', '/customers/c-03', {
+      packageId: 'pkg-20m',
+      packageName: 'Paket 20 Mbps',
+    });
+    assert.equal(upd.status, 200);
+    assert.equal(upd.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets[0].profile, 'prof-pppoe-20m');
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 4: Update paket gagal sebelum profile berubah -> sesi aktif TIDAK diputus
+  await runScenario(4, 'Update paket gagal sebelum profile berubah -> sesi aktif TIDAK diputus', async () => {
+    await api('POST', '/customers', {
+      id: 'c-04',
+      name: 'Dedi',
+      phone: '0844',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'dedi04',
+      password: 'Password04',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*A4', name: 'dedi04' });
+    mockRouter.trapOnCommand.set('/ppp/secret/set', 'router readonly error');
+
+    const upd = await api('PUT', '/customers/c-04', {
+      packageId: 'pkg-20m',
+      packageName: 'Paket 20 Mbps',
+    });
+    assert.equal(upd.status, 200);
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.pppoeSecrets[0].profile, 'prof-pppoe-10m');
+    assert.equal(mockRouter.pppoeActives.length, 1, 'Sesi aktif tidak boleh diputus saat set gagal!');
+    const meta = decodeV1Meta(upd.json.data.routerLastSyncMessage);
+    assert.equal(meta.needsSessionDisconnect, true);
+  });
+
+  // Skenario 5: Profile berubah, tetapi putus salah satu sesi aktif gagal -> failed + retry sync-router berhasil hingga synced
+  await runScenario(5, 'Profile berubah, salah satu putus sesi gagal -> failed -> retry sync-router sukses synced', async () => {
+    await api('POST', '/customers', {
+      id: 'c-05',
+      name: 'Eka',
+      phone: '0855',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'eka05',
+      password: 'Password05',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*S5A', name: 'eka05' }, { '.id': '*S5B', name: 'eka05' });
+    mockRouter.failRemoveIds.add('*S5B');
+
+    const upd = await api('PUT', '/customers/c-05', {
+      packageId: 'pkg-20m',
+      packageName: 'Paket 20 Mbps',
+    });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.pppoeSecrets[0].profile, 'prof-pppoe-20m');
+    assert.equal(mockRouter.pppoeActives.length, 1);
+    const meta = decodeV1Meta(upd.json.data.routerLastSyncMessage);
+    assert.equal(meta.needsSessionDisconnect, true);
+
+    mockRouter.failRemoveIds.delete('*S5B');
+    const retry = await api('POST', '/customers/c-05/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 6: Ganti username PPPoE/Hotspot -> akun baru dibuat & diverifikasi, akun lama dihapus & sesinya diputus
+  await runScenario(6, 'Ganti username PPPoE -> akun baru terverifikasi, akun lama & sesinya bersih', async () => {
+    await api('POST', '/customers', {
+      id: 'c-06',
+      name: 'Fajar',
+      phone: '0866',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'fajar_lama',
+      password: 'Password06',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*A6', name: 'fajar_lama' });
+
+    const upd = await api('PUT', '/customers/c-06', { username: 'fajar_baru' });
+    assert.equal(upd.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'fajar_baru'), true);
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'fajar_lama'), false);
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 7: Ubah tipe PPPoE <-> Hotspot -> akun baru dibuat, akun lama tipe berbeda dihapus & sesinya diputus
+  await runScenario(7, 'Ubah tipe PPPoE ke Hotspot -> akun Hotspot dibuat, secret PPPoE & sesi lama bersih', async () => {
+    await api('POST', '/customers', {
+      id: 'c-07',
+      name: 'Gina',
+      phone: '0877',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'gina_pppoe',
+      password: 'Password07',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*A7', name: 'gina_pppoe' });
+
+    const upd = await api('PUT', '/customers/c-07', { type: 'hotspot', username: 'gina_hs' });
+    assert.equal(upd.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.hotspotUsers.some((u) => u.name === 'gina_hs' && u.profile === 'prof-hs-10m'), true);
+    assert.equal(mockRouter.pppoeSecrets.length, 0);
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 8: Akun baru gagal dibuat/diverifikasi saat perubahan identitas -> akun lama & sesi lama TIDAK dihapus
+  await runScenario(8, 'Akun baru gagal dibuat saat ganti identitas -> akun lama & sesi TIDAK dihapus', async () => {
+    await api('POST', '/customers', {
+      id: 'c-08',
+      name: 'Hadi',
+      phone: '0888',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'hadi_lama',
+      password: 'Password08',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*A8', name: 'hadi_lama' });
+    mockRouter.trapOnCommand.set('/ppp/secret/add', 'cannot create secret');
+
+    const upd = await api('PUT', '/customers/c-08', { username: 'hadi_baru' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    assert.equal(dbStore.customers.get('c-08')?.username, 'hadi_baru');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'hadi_lama'), true);
+    assert.equal(mockRouter.pppoeActives.length, 1);
+    const meta = decodeV1Meta(upd.json.data.routerLastSyncMessage);
+    assert.deepEqual(meta.oldAccounts, [{ type: 'pppoe', username: 'hadi_lama' }]);
+  });
+
+  // Skenario 9: Akun baru berhasil, hapus akun lama gagal -> status failed + penanda oldAccounts -> retry bersih hingga synced
+  await runScenario(9, 'Akun baru OK, hapus akun lama gagal -> failed + SYNC_META_V1 -> retry sukses synced', async () => {
+    await api('POST', '/customers', {
+      id: 'c-09',
+      name: 'Indra',
+      phone: '0899',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'indra_lama',
+      password: 'Password09',
+      status: 'active',
+    });
+    const oldId = mockRouter.pppoeSecrets[0]['.id'];
+    mockRouter.pppoeActives.push({ '.id': '*A9', name: 'indra_lama' });
+    mockRouter.failRemoveIds.add(oldId);
+
+    const upd = await api('PUT', '/customers/c-09', { username: 'indra_baru' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'indra_baru'), true);
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'indra_lama'), true);
+
+    mockRouter.failRemoveIds.delete(oldId);
+    const retry = await api('POST', '/customers/c-09/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'indra_lama'), false);
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 10: Pembaruan berikutnya dengan username/tipe sama ketika akun lama belum bersih -> akun lama tetap tidak hilang
+  await runScenario(10, 'Edit berikutnya dengan username/tipe sama tetap membawa penanda akun lama tertunda', async () => {
+    await api('POST', '/customers', {
+      id: 'c-10',
+      name: 'Joko',
+      phone: '0810',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'joko_lama',
+      password: 'Password10',
+      status: 'active',
+    });
+    const oldId = mockRouter.pppoeSecrets[0]['.id'];
+    mockRouter.failRemoveIds.add(oldId);
+
+    const upd1 = await api('PUT', '/customers/c-10', { username: 'joko_baru' });
+    assert.equal(upd1.json.data.routerSyncStatus, 'failed');
+
+    // Edit kedua: hanya ubah nama (username tetap joko_baru), cleanup masih gagal
+    const upd2 = await api('PUT', '/customers/c-10', { name: 'Joko Updated' });
+    assert.equal(upd2.json.data.routerSyncStatus, 'failed');
+    const meta2 = decodeV1Meta(upd2.json.data.routerLastSyncMessage);
+    assert.deepEqual(meta2.oldAccounts, [{ type: 'pppoe', username: 'joko_lama' }]);
+
+    // Pulihkan & retry -> baru bersih
+    mockRouter.failRemoveIds.delete(oldId);
+    const retry = await api('POST', '/customers/c-10/sync-router');
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'joko_lama'), false);
+  });
+
+  // Skenario 11: Username mengandung karakter khusus tersimpan utuh di penanda & dibersihkan saat retry
+  await runScenario(11, 'Username berkarakter khusus tersimpan utuh di SYNC_META_V1 dan dibersihkan saat retry', async () => {
+    const specialUser = 'user@kota+1#rt02/a';
+    await api('POST', '/customers', {
+      id: 'c-11',
+      name: 'Kiki Special',
+      phone: '0811',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: specialUser,
+      password: 'Password11',
+      status: 'active',
+    });
+    const oldId = mockRouter.pppoeSecrets[0]['.id'];
+    mockRouter.pppoeActives.push({ '.id': '*A11', name: specialUser });
+    mockRouter.failRemoveIds.add(oldId);
+
+    const upd = await api('PUT', '/customers/c-11', { username: 'kiki_new' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    const meta = decodeV1Meta(upd.json.data.routerLastSyncMessage);
+    assert.deepEqual(meta.oldAccounts, [{ type: 'pppoe', username: specialUser }]);
+
+    mockRouter.failRemoveIds.delete(oldId);
+    const retry = await api('POST', '/customers/c-11/sync-router');
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === specialUser), false);
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 12: Username mengandung koma tersimpan utuh di penanda (tidak terpecah koma) & dibersihkan saat retry
+  await runScenario(12, 'Username mengandung koma tersimpan utuh di SYNC_META_V1 dan dibersihkan saat retry', async () => {
+    const commaUser = 'warga,blokA,01';
+    await api('POST', '/customers', {
+      id: 'c-12',
+      name: 'Lina Comma',
+      phone: '0812',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'hotspot',
+      username: commaUser,
+      password: 'Password12',
+      status: 'active',
+    });
+    const oldId = mockRouter.hotspotUsers[0]['.id'];
+    mockRouter.hotspotActives.push({ '.id': '*H12', user: commaUser });
+    mockRouter.failRemoveIds.add(oldId);
+
+    const upd = await api('PUT', '/customers/c-12', { username: 'lina_new' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+    const meta = decodeV1Meta(upd.json.data.routerLastSyncMessage);
+    assert.equal(meta.oldAccounts.length, 1);
+    assert.deepEqual(meta.oldAccounts[0], { type: 'hotspot', username: commaUser });
+
+    mockRouter.failRemoveIds.delete(oldId);
+    const retry = await api('POST', '/customers/c-12/sync-router');
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.hotspotUsers.some((u) => u.name === commaUser), false);
+    assert.equal(mockRouter.hotspotActives.length, 0);
+  });
+
+  // Skenario 13: Penanda router_last_sync_message rusak/terpotong -> gagal aman (failed), tidak auto-synced
+  await runScenario(13, 'Penanda router_last_sync_message rusak/terpotong -> failed aman, tidak pernah auto-synced', async () => {
+    await api('POST', '/customers', {
+      id: 'c-13',
+      name: 'Mona Corrupt',
+      phone: '0813',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'mona13',
+      password: 'Password13',
+      status: 'active',
+    });
+    const row = dbStore.customers.get('c-13')!;
+    row.router_sync_status = 'failed';
+    row.router_last_sync_message = 'Gagal sebelumnya [SYNC_META_V1:broken_truncated_b64';
+
+    const retry = await api('POST', '/customers/c-13/sync-router');
+    assert.equal(retry.status, 422);
+    assert.equal(retry.json.success, false);
+    assert.equal(retry.json.data.routerSyncStatus, 'failed');
+    assert.equal(dbStore.customers.get('c-13')?.router_sync_status, 'failed');
+
+    const patchRes = await api('PATCH', '/customers/c-13/status', { status: 'active' });
+    assert.equal(patchRes.status, 200);
+    assert.equal(patchRes.json.data.routerSyncStatus, 'failed');
+    const metaAfter = decodeV1Meta(patchRes.json.data.routerLastSyncMessage);
+    assert.equal(metaAfter.corrupted, true);
+  });
+
+  // Skenario 14: Duplikasi akun username persis sama (>1 entri) -> ditolak dengan error jelas, tidak hapus sembarangan
+  await runScenario(14, 'Duplikasi akun exact username (>1) -> ditolak failed tanpa menghapus akun', async () => {
+    mockRouter.pppoeSecrets.push(
+      { '.id': '*DUP1', name: 'dup_user', password: 'Password14', profile: 'prof-pppoe-10m', disabled: 'false' },
+      { '.id': '*DUP2', name: 'dup_user', password: 'Password14', profile: 'prof-pppoe-10m', disabled: 'false' },
+      { '.id': '*OTHER', name: 'pelanggan_lain', password: 'Other', profile: 'prof-pppoe-10m', disabled: 'false' }
+    );
+    const res = await api('POST', '/customers', {
+      id: 'c-14',
+      name: 'Niko Dup',
+      phone: '0814',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'dup_user',
+      password: 'Password14',
+      status: 'active',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.data.routerSyncStatus, 'failed');
+    assert.match(res.json.data.routerLastSyncMessage, /duplikat|Duplikasi/i);
+    assert.equal(mockRouter.pppoeSecrets.length, 3, 'Tidak boleh menghapus entri duplikat atau akun lain sembarangan!');
+  });
+
+  // Skenario 15: Perbedaan huruf besar/kecil username (case-sensitivity)
+  await runScenario(15, 'Case-sensitive username matching -> Budi01 tidak ikut tersentuh saat kelola budi01', async () => {
+    mockRouter.pppoeSecrets.push({
+      '.id': '*CASE_UP',
+      name: 'Budi01',
+      password: 'UpperPass',
+      profile: 'prof-pppoe-10m',
+      disabled: 'false',
+    });
+    mockRouter.pppoeActives.push({ '.id': '*ACT_UP', name: 'Budi01' });
+
+    const res = await api('POST', '/customers', {
+      id: 'c-15',
+      name: 'budi lower',
+      phone: '0815',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'budi01',
+      password: 'LowerPassword15',
+      status: 'active',
+    });
+    assert.equal(res.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.length, 2);
+
+    // Putuskan sesi budi01 -> Budi01 tidak ikut terputus
+    mockRouter.pppoeActives.push({ '.id': '*ACT_LOW', name: 'budi01' });
+    const patchIso = await api('PATCH', '/customers/c-15/status', { status: 'isolated' });
+    assert.equal(patchIso.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.find((s) => s.name === 'Budi01')?.disabled, 'false');
+    assert.equal(mockRouter.pppoeSecrets.find((s) => s.name === 'budi01')?.disabled, 'true');
+    assert.equal(mockRouter.pppoeActives.length, 1);
+    assert.equal(mockRouter.pppoeActives[0].name, 'Budi01');
+  });
+
+  // Skenario 16: PATCH /customers/:id/status ketika ada pekerjaan tertunda (needsSessionDisconnect & oldAccounts)
+  await runScenario(16, 'PATCH status menjaga & memproses pending needsSessionDisconnect dan oldAccounts hingga benar-benar tuntas', async () => {
+    await api('POST', '/customers', {
+      id: 'c-16',
+      name: 'Oki Status',
+      phone: '0816',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'oki_lama',
+      password: 'Password16',
+      status: 'active',
+    });
+    const oldId = mockRouter.pppoeSecrets[0]['.id'];
+    mockRouter.pppoeActives.push({ '.id': '*A16_OLD', name: 'oki_lama' });
+    mockRouter.failRemoveIds.add(oldId);
+
+    // Ganti username, cleanup gagal -> tertunda oldAccount
+    const upd = await api('PUT', '/customers/c-16', { username: 'oki_baru' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed');
+
+    // Tambahkan sesi aktif baru & gagalkan remove sesi saat isolated
+    mockRouter.pppoeActives.push({ '.id': '*A16_NEW', name: 'oki_baru' });
+    mockRouter.failRemoveIds.add('*A16_NEW');
+
+    const patchIso = await api('PATCH', '/customers/c-16/status', { status: 'isolated' });
+    assert.equal(patchIso.json.data.routerSyncStatus, 'failed');
+
+    // Sekarang ubah kembali ke active sementara oki_baru masih punya pending disconnect & cleanup masih gagal -> toggle enable OK tetapi status HARUS tetap failed!
+    const patchBackFail = await api('PATCH', '/customers/c-16/status', { status: 'active' });
+    assert.equal(patchBackFail.json.data.routerSyncStatus, 'failed');
+    const metaBack = decodeV1Meta(patchBackFail.json.data.routerLastSyncMessage);
+    assert.equal(metaBack.needsSessionDisconnect, true);
+    assert.deepEqual(metaBack.oldAccounts, [{ type: 'pppoe', username: 'oki_lama' }]);
+
+    // Pulihkan semua fault & PATCH status active -> seluruh pending bersih -> barulah boleh synced!
+    mockRouter.failRemoveIds.delete(oldId);
+    mockRouter.failRemoveIds.delete('*A16_NEW');
+    const patchClean = await api('PATCH', '/customers/c-16/status', { status: 'active' });
+    assert.equal(patchClean.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'oki_lama'), false);
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 17: !trap, !fatal, router offline, dan verifikasi pasca-remove 0 sesi aktif tersisa
+  await runScenario(17, '!trap, !fatal, router offline, verifikasi pasca-remove 0 sesi, dan kompatibilitas penanda lama', async () => {
+    // 17a: Router offline saat POST customer -> data tersimpan di PostgreSQL, routerSyncStatus = failed
+    mockRouter.offline = true;
+    const postOffline = await api('POST', '/customers', {
+      id: 'c-17',
+      name: 'Rina Fault',
+      phone: '0817',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'rina17',
+      password: 'Password17',
+      status: 'active',
+    });
+    assert.equal(postOffline.status, 200);
+    assert.equal(postOffline.json.data.routerSyncStatus, 'failed');
+    assert.ok(dbStore.customers.has('c-17'), 'Data pelanggan harus tetap tersimpan saat router offline!');
+
+    // 17b: !fatal pada provisioning saat retry -> tertangani sebagai failed eksplisit
+    mockRouter.offline = false;
+    mockRouter.fatalOnCommand.set('/ppp/secret/add', 'critical router failure');
+    const retryFatal = await api('POST', '/customers/c-17/sync-router');
+    assert.equal(retryFatal.json.data.routerSyncStatus, 'failed');
+
+    // 17c: Provisioning sukses
+    mockRouter.fatalOnCommand.clear();
+    const retryOk = await api('POST', '/customers/c-17/sync-router');
+    assert.equal(retryOk.json.data.routerSyncStatus, 'synced');
+
+    // 17d: !trap saat /ppp/secret/set
+    mockRouter.trapOnCommand.set('/ppp/secret/set', 'invalid profile constraint');
+    const trapUpd = await api('PUT', '/customers/c-17', { packageId: 'pkg-20m', packageName: 'Paket 20 Mbps' });
+    assert.equal(trapUpd.json.data.routerSyncStatus, 'failed');
+    mockRouter.trapOnCommand.clear();
+
+    // 17e: Verifikasi pasca-remove (remove reply !done namun sesi masih tersisa saat /print ulang)
+    mockRouter.pppoeActives.push({ '.id': '*LINGER1', name: 'rina17' });
+    mockRouter.lingerAfterRemoveIds.add('*LINGER1');
+    const dcRes = await disconnectPppoeSession(
+      { host: '127.0.0.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
+      'rina17'
+    );
+    assert.equal(dcRes.success, false, 'Harus gagal jika sesi masih tersisa saat verifikasi /print pasca-remove!');
+    assert.match(dcRes.message, /tertinggal|masih terdapat/i);
+
+    mockRouter.hotspotActives.push({ '.id': '*HLINGER', user: 'rina_hs' });
+    mockRouter.lingerAfterRemoveIds.add('*HLINGER');
+    const hsDcRes = await disconnectHotspotSession(
+      { host: '127.0.0.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
+      'rina_hs'
+    );
+    assert.equal(hsDcRes.success, false);
+
+    // Uji helper createOrUpdatePppoeSecret ketika duplicate muncul langsung
+    mockRouter.pppoeSecrets.push({ '.id': '*EX1', name: 'rina17', password: 'Password17', profile: 'prof-pppoe-10m', disabled: 'false' });
+    await assert.rejects(
+      () =>
+        createOrUpdatePppoeSecret(
+          { host: '127.0.0.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
+          { username: 'rina17', password: 'Password17', profile: 'prof-pppoe-10m' }
+        ),
+      /duplikat/i
+    );
+
+    // 17f: Kompatibilitas mundur penanda versi lama [Perlu pembersihan akun lama: ...] & [Perlu ulang pemutusan sesi]
+    mockRouter.lingerAfterRemoveIds.clear();
+    mockRouter.pppoeActives = [{ '.id': '*LEGACY_ACT', name: 'legacy_old_user' }];
+    mockRouter.pppoeSecrets = [
+      { '.id': '*L_OLD', name: 'legacy_old_user', password: 'Password17', profile: 'prof-pppoe-10m', disabled: 'false' },
+      { '.id': '*L_NEW', name: 'rina17', password: 'Password17', profile: 'prof-pppoe-10m', disabled: 'false' },
+    ];
+    const row = dbStore.customers.get('c-17')!;
+    row.router_sync_status = 'failed';
+    row.router_last_sync_message =
+      'Gagal lama [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:legacy_old_user]';
+
+    const legacyRetry = await api('POST', '/customers/c-17/sync-router');
+    assert.equal(legacyRetry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'legacy_old_user'), false);
+    assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Restore prototypes & stop servers cleanly
+  pg.Pool.prototype.query = origQuery;
+  pg.Pool.prototype.connect = origConnect;
+  await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  await mockRouter.stop();
+
+  console.log(`\nRINGKASAN PENGUJIAN MIKROTIK TAHAP 1: TOTAL=${passed + failed}, PASS=${passed}, FAIL=${failed}`);
+  process.exit(failed > 0 ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error('Fatal error in mikrotikIntegration.test.ts:', err);
+  process.exit(1);
+});
