@@ -31,6 +31,9 @@ import {
   sanitizeMikrotikError,
   sanitizeGenericServerError,
   redactSensitiveText,
+  parseSyncMetaV1Payload,
+  MAX_SYNC_META_V1_OLD_ACCOUNTS,
+  MAX_SYNC_META_V1_USERNAME_LENGTH,
   toAllowedErrorCode,
   logSafeServerError,
 } from './errorSanitizer.js';
@@ -124,57 +127,35 @@ export function parsePendingSyncActions(lastSyncStatus?: string | null, lastSync
 
   for (const match of v1Matches) {
     const rawB64 = (match[1] || '').trim();
-    if (!rawB64 || !/^[A-Za-z0-9_-]+$/.test(rawB64)) {
+    const validation = parseSyncMetaV1Payload(rawB64);
+    if (!validation.valid) {
       corrupted = true;
-      corruptedReason = 'Payload Base64URL pada penanda [SYNC_META_V1] tidak valid.';
+      corruptedReason = validation.reason;
       continue;
     }
-    try {
-      const jsonStr = Buffer.from(rawB64, 'base64url').toString('utf8');
-      const parsed = JSON.parse(jsonStr);
-      if (
-        !parsed ||
-        typeof parsed !== 'object' ||
-        Array.isArray(parsed) ||
-        parsed.v !== 1 ||
-        typeof parsed.needsSessionDisconnect !== 'boolean' ||
-        !Array.isArray(parsed.oldAccounts)
-      ) {
-        corrupted = true;
-        corruptedReason = 'Struktur JSON penanda [SYNC_META_V1] tidak valid atau versi tidak dikenali.';
-        continue;
-      }
-      let blockEntryInvalid = false;
-      for (const item of parsed.oldAccounts) {
-        if (
-          !item ||
-          typeof item !== 'object' ||
-          (item.type !== 'pppoe' && item.type !== 'hotspot') ||
-          typeof item.username !== 'string' ||
-          !item.username.trim()
-        ) {
-          corrupted = true;
-          corruptedReason = 'Entri akun lama pada penanda [SYNC_META_V1] rusak.';
-          blockEntryInvalid = true;
-          continue;
-        }
-        addOldAcc(item.type, item.username);
-      }
-      if (parsed.corrupted === true) {
-        corrupted = true;
-        corruptedReason = 'Status kegagalan sebelumnya menandai penanda sinkronisasi rusak dan butuh pemeriksaan manual.';
-      } else if (!blockEntryInvalid) {
-        validV1Count++;
-      }
-      if (parsed.needsSessionDisconnect) {
-        needsSessionDisconnect = true;
-      }
-      if (parsed.stages && typeof parsed.stages === 'object') {
-        stages = { ...stages, ...parsed.stages };
-      }
-    } catch {
+
+    const parsed = validation.payload;
+    if (oldAccounts.length + parsed.oldAccounts.length > MAX_SYNC_META_V1_OLD_ACCOUNTS) {
       corrupted = true;
-      corruptedReason = 'Gagal membaca JSON dari penanda [SYNC_META_V1].';
+      corruptedReason = 'Total akun lama pada penanda [SYNC_META_V1] melebihi batas aman.';
+      continue;
+    }
+
+    for (const item of parsed.oldAccounts) {
+      addOldAcc(item.type, item.username);
+    }
+
+    if (parsed.corrupted === true) {
+      corrupted = true;
+      corruptedReason = 'Status kegagalan sebelumnya menandai penanda sinkronisasi rusak dan butuh pemeriksaan manual.';
+    } else {
+      validV1Count++;
+    }
+    if (parsed.needsSessionDisconnect) {
+      needsSessionDisconnect = true;
+    }
+    if (parsed.stages) {
+      stages = { ...stages, ...parsed.stages };
     }
   }
 
@@ -354,10 +335,12 @@ function finalizeSafeSyncText(message: string, maxLen: number = MAX_SYNC_TEXT_LE
 
 function sanitizeSyncMessagePreservingMeta(message: string | null | undefined): string {
   if (!message || typeof message !== 'string') return '';
-  const v1Tags = [...message.matchAll(/\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g)].map((m) => m[0]);
-  const cleanBody = finalizeSafeSyncText(message.replace(/\s*\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g, ''));
-  if (v1Tags.length === 0) return cleanBody;
-  return cleanBody ? `${cleanBody} ${v1Tags.join(' ')}` : v1Tags.join(' ');
+  const validV1Tags = [...message.matchAll(/\[SYNC_META_V1:([^\]]*)\]/g)]
+    .filter((m) => parseSyncMetaV1Payload(m[1]).valid)
+    .map((m) => `[SYNC_META_V1:${m[1].trim()}]`);
+  const cleanBody = finalizeSafeSyncText(message.replace(/\s*\[SYNC_META_V1:[^\]]*\]/g, ''));
+  if (validV1Tags.length === 0) return cleanBody;
+  return cleanBody ? `${cleanBody} ${validV1Tags.join(' ')}` : validV1Tags.join(' ');
 }
 
 function appendPendingMarkers(
@@ -374,14 +357,70 @@ function appendPendingMarkers(
     return cleanBase;
   }
 
+  let forceCorrupted = Boolean(pending.corrupted);
+  const safeOldAccounts: PendingRouterAccount[] = [];
+  const seen = new Set<string>();
+  for (const item of pending.oldAccounts) {
+    if (safeOldAccounts.length >= MAX_SYNC_META_V1_OLD_ACCOUNTS) {
+      forceCorrupted = true;
+      break;
+    }
+    if (!item || (item.type !== 'pppoe' && item.type !== 'hotspot') || typeof item.username !== 'string') {
+      forceCorrupted = true;
+      continue;
+    }
+    const cleanUser = item.username.trim();
+    if (
+      cleanUser.length < 1 ||
+      cleanUser.length > MAX_SYNC_META_V1_USERNAME_LENGTH ||
+      /[\x00-\x1F\x7F\u2028\u2029]/.test(cleanUser)
+    ) {
+      forceCorrupted = true;
+      continue;
+    }
+    const key = `${item.type}:${cleanUser}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      safeOldAccounts.push({ type: item.type, username: cleanUser });
+    }
+  }
+
+  const cleanStages: PendingSyncStages | undefined = pending.stages
+    ? {
+        ...(typeof pending.stages.accountProvisioned === 'boolean'
+          ? { accountProvisioned: pending.stages.accountProvisioned }
+          : {}),
+        ...(typeof pending.stages.accountVerified === 'boolean'
+          ? { accountVerified: pending.stages.accountVerified }
+          : {}),
+        ...(typeof pending.stages.oldAccountsPending === 'number' &&
+        Number.isInteger(pending.stages.oldAccountsPending) &&
+        pending.stages.oldAccountsPending >= 0
+          ? { oldAccountsPending: Math.min(pending.stages.oldAccountsPending, MAX_SYNC_META_V1_OLD_ACCOUNTS) }
+          : {}),
+        ...(typeof pending.stages.sessionDisconnectPending === 'boolean'
+          ? { sessionDisconnectPending: pending.stages.sessionDisconnectPending }
+          : {}),
+      }
+    : undefined;
+
   const payload: PendingSyncPayloadV1 = {
     v: 1,
-    needsSessionDisconnect: Boolean(pending.needsSessionDisconnect || pending.corrupted),
-    oldAccounts: pending.oldAccounts,
-    ...(pending.corrupted ? { corrupted: true } : {}),
-    ...(pending.stages ? { stages: pending.stages } : {}),
+    needsSessionDisconnect: Boolean(pending.needsSessionDisconnect || forceCorrupted),
+    oldAccounts: safeOldAccounts,
+    ...(forceCorrupted ? { corrupted: true } : {}),
+    ...(cleanStages ? { stages: cleanStages } : {}),
   };
-  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  let encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  if (!parseSyncMetaV1Payload(encoded).valid) {
+    const safeFallbackPayload: PendingSyncPayloadV1 = {
+      v: 1,
+      needsSessionDisconnect: true,
+      oldAccounts: [],
+      corrupted: true,
+    };
+    encoded = Buffer.from(JSON.stringify(safeFallbackPayload), 'utf8').toString('base64url');
+  }
   return `${cleanBase} [SYNC_META_V1:${encoded}]`;
 }
 

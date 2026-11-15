@@ -864,7 +864,10 @@ async function main() {
   const {
     ALLOWED_ERROR_CODES,
     ALLOWED_SOCKET_ERROR_CODES,
+    FATAL_ERROR_CODES,
     SafeOperationalError,
+    isFatalMikrotikError,
+    parseSyncMetaV1Payload,
     sanitizeSocketErrorCode,
     sanitizeDatabaseError,
     sanitizeMikrotikError,
@@ -2602,7 +2605,7 @@ async function main() {
       assert.equal(mapped, 'NETWORK_ERROR', `Kode non-socket "${nonSocket}" tidak boleh diklasifikasikan sebagai kode socket (${mapped})`);
     }
     assert.equal(sanitizeSocketErrorCode({ code: 'UNKNOWN_99', message: 'unexpected io failure' }), 'NETWORK_ERROR');
-    assert.equal(sanitizeSocketErrorCode({ code: 'UNKNOWN_SSL', message: 'SSL handshake certificate error' }), 'TLS_ERROR');
+    assert.equal(sanitizeSocketErrorCode({ code: 'ERR_TLS_CERT_ALTNAME_INVALID', message: 'cert altname' }), 'TLS_ERROR');
   });
 
   // Skenario 43: logSafeServerError memblokir log injection, newline, SQL, kredensial, username/body, & membatasi panjang
@@ -2648,6 +2651,368 @@ async function main() {
     assert.equal(safeLog.context, 'POST /api/customers/sync');
     assert.equal(safeLog.operation, 'UPDATE');
     assert.equal(safeLog.resourceId, 'c-safe-43');
+  });
+
+  // Skenario 44: Penentuan isFatal hanya berlaku untuk FATAL_ERROR_CODES (tidak pernah true untuk non-fatal walau options.isFatal=true)
+  await runScenario(44, 'Audit Keamanan Lanjutan: isFatal hanya true untuk FATAL_ERROR_CODES, tidak pernah untuk DB/INTERNAL/NETWORK/non-fatal', async () => {
+    assert.ok(FATAL_ERROR_CODES.has('ROUTEROS_FATAL'));
+
+    const legitimateFatal = new SafeOperationalError('ROUTEROS_FATAL', 'Koneksi dihentikan router.', { isFatal: true });
+    assert.equal(legitimateFatal.isFatal, true);
+    assert.equal(isFatalMikrotikError(legitimateFatal), true);
+    assert.equal(sanitizeMikrotikError(legitimateFatal, 'Fallback').isFatal, true);
+
+    const legitimateFatalNoOpt = new SafeOperationalError('ROUTEROS_FATAL', 'Koneksi dihentikan router.');
+    assert.equal(legitimateFatalNoOpt.isFatal, true);
+    assert.equal(isFatalMikrotikError(legitimateFatalNoOpt), true);
+
+    const nonFatalWithTrueFlag = [
+      'DB_QUERY_ERROR',
+      'INTERNAL_ERROR',
+      'NETWORK_ERROR',
+      'ROUTEROS_TRAP',
+      'VALIDATION_ERROR',
+      'ETIMEDOUT',
+      'UNKNOWN_ARBITRARY',
+    ];
+    for (const code of nonFatalWithTrueFlag) {
+      const err = new SafeOperationalError(code as any, 'Error nonfatal', { isFatal: true });
+      assert.equal(err.isFatal, false, `Kode non-fatal "${code}" tidak boleh menjadi fatal meskipun options.isFatal=true`);
+      assert.equal(isFatalMikrotikError(err), false, `isFatalMikrotikError harus false untuk "${code}"`);
+      assert.equal(sanitizeMikrotikError(err, 'Fallback').isFatal, false);
+    }
+
+    // Tampered plain/subclass-like object with non-fatal code cannot pass isFatalMikrotikError
+    assert.equal(isFatalMikrotikError({ code: 'ROUTEROS_FATAL', isFatal: true }), false);
+  });
+
+  // Skenario 45: Validasi ketat marker SYNC_META_V1 (ukuran, Base64URL, JSON, properti asing, panjang username, & kredensial)
+  await runScenario(45, 'Audit Keamanan Lanjutan: Validasi ketat SYNC_META_V1 menolak marker terlalu besar/rusak/properti asing/username panjang/kredensial & pertahankan retry valid', async () => {
+    const toB64 = (obj: unknown) => Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
+
+    // 45a: Marker valid dipertahankan utuh oleh redactSensitiveText dan di-parse oleh parsePendingSyncActions
+    const validObj = {
+      v: 1,
+      needsSessionDisconnect: true,
+      oldAccounts: [{ type: 'pppoe', username: 'user_valid#01,ok' }],
+      stages: { accountProvisioned: true, accountVerified: true, oldAccountsPending: 1, sessionDisconnectPending: true },
+    };
+    const validTag = `[SYNC_META_V1:${toB64(validObj)}]`;
+    assert.equal(redactSensitiveText(`Info gagal ${validTag}`), `Info gagal ${validTag}`);
+    const parsedValid = parsePendingSyncActions('failed', `Info gagal ${validTag}`);
+    assert.equal(parsedValid.corrupted, false);
+    assert.equal(parsedValid.needsSessionDisconnect, true);
+    assert.deepEqual(parsedValid.oldAccounts, [{ type: 'pppoe', username: 'user_valid#01,ok' }]);
+
+    // 45b: Kumpulan marker tidak valid (terlalu besar, Base64URL rusak, JSON rusak, properti asing, >10 oldAccounts, username >64, kredensial)
+    const oversizedManyAccounts = toB64({
+      v: 1,
+      needsSessionDisconnect: false,
+      oldAccounts: Array.from({ length: 11 }, (_, idx) => ({ type: 'pppoe', username: `old_user_${idx}` })),
+    });
+    const oversizedRawTag = `[SYNC_META_V1:${'A'.repeat(2100)}]`;
+    const badB64Tag = '[SYNC_META_V1:not!valid@base64#]';
+    const badJsonTag = `[SYNC_META_V1:${Buffer.from('{broken_json', 'utf8').toString('base64url')}]`;
+    const foreignPropTag = `[SYNC_META_V1:${toB64({ v: 1, needsSessionDisconnect: false, oldAccounts: [{ type: 'pppoe', username: 'should_not_run' }], extraField: 'evil' })}]`;
+    const longUsernameTag = `[SYNC_META_V1:${toB64({ v: 1, needsSessionDisconnect: false, oldAccounts: [{ type: 'hotspot', username: 'u'.repeat(65) }] })}]`;
+    const secretInPropTag = `[SYNC_META_V1:${toB64({ v: 1, needsSessionDisconnect: false, oldAccounts: [], password: 'SECRET_META_PASSWORD' })}]`;
+    const secretInUserTag = `[SYNC_META_V1:${toB64({ v: 1, needsSessionDisconnect: false, oldAccounts: [{ type: 'pppoe', username: 'enc:v1:aa:bb:cc' }] })}]`;
+    const envSecretInUserTag = `[SYNC_META_V1:${toB64({ v: 1, needsSessionDisconnect: false, oldAccounts: [{ type: 'pppoe', username: String(process.env.MIKROTIK_ENCRYPTION_KEY).slice(0, 40) }] })}]`;
+
+    const invalidTags = [
+      { label: 'oversizedRaw', tag: oversizedRawTag },
+      { label: 'oversizedAccounts', tag: `[SYNC_META_V1:${oversizedManyAccounts}]` },
+      { label: 'badBase64', tag: badB64Tag },
+      { label: 'badJson', tag: badJsonTag },
+      { label: 'foreignProp', tag: foreignPropTag },
+      { label: 'longUsername', tag: longUsernameTag },
+      { label: 'secretInProp', tag: secretInPropTag },
+      { label: 'secretInUser', tag: secretInUserTag },
+      { label: 'envSecretInUser', tag: envSecretInUserTag },
+    ];
+
+    for (const item of invalidTags) {
+      const redacted = redactSensitiveText(`Gagal ${item.tag}`);
+      assert.ok(!redacted.includes('[SYNC_META_V1:'), `redactSensitiveText harus menolak marker tidak valid (${item.label})`);
+      assert.ok(!redacted.includes('SECRET_META_PASSWORD'), `Marker ${item.label} tidak boleh membocorkan kredensial`);
+
+      const parsed = parsePendingSyncActions('failed', `Gagal ${item.tag}`);
+      assert.equal(parsed.corrupted, true, `parsePendingSyncActions wajib menandai corrupted (${item.label})`);
+      assert.equal(parsed.oldAccounts.length, 0, `Tidak boleh mengekstrak oldAccounts dari metadata tidak valid (${item.label})`);
+    }
+
+    assert.equal(parseSyncMetaV1Payload(toB64({ v: 2, needsSessionDisconnect: false, oldAccounts: [] })).valid, false);
+
+    // 45c: Endpoint sync-router menolak marker tidak valid (HTTP 422) & TIDAK mengeksekusi perintah router apa pun
+    await api('POST', '/customers', {
+      id: 'c-sec-45',
+      name: 'Audit Invalid Meta Sync',
+      phone: '084500',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec45_user',
+      password: 'CustomerSecret45',
+      status: 'active',
+    });
+    const row45 = dbStore.customers.get('c-sec-45')!;
+    row45.router_sync_status = 'failed';
+    row45.router_last_sync_message = `Gagal ${foreignPropTag}`;
+    const cmdCountBefore = mockRouter.commandLog.length;
+
+    const retry45 = await api('POST', '/customers/c-sec-45/sync-router');
+    assert.equal(retry45.status, 422);
+    assert.equal(retry45.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.commandLog.length, cmdCountBefore, 'Router tidak boleh disentuh ketika SYNC_META_V1 melanggar validasi');
+  });
+
+  // Skenario 46: sanitizeSocketErrorCode mempercayai allowlist socket & TLS code spesifik, menolak spoofing pesan TLS/SSL & kode DB/aplikasi
+  await runScenario(46, 'Audit Keamanan Lanjutan: sanitizeSocketErrorCode tolak spoofing pesan TLS/SSL, kode SQLSTATE, & kode aplikasi', async () => {
+    const validSockets: Array<[any, string]> = [
+      [{ code: 'ECONNREFUSED' }, 'ECONNREFUSED'],
+      [{ code: 'ETIMEDOUT' }, 'ETIMEDOUT'],
+      [{ code: 'EHOSTUNREACH' }, 'EHOSTUNREACH'],
+      [{ code: 'ENETUNREACH' }, 'ENETUNREACH'],
+      [{ code: 'ENOTFOUND' }, 'ENOTFOUND'],
+      [{ code: 'ECONNRESET' }, 'ECONNRESET'],
+      [{ code: 'EPIPE' }, 'EPIPE'],
+      [{ code: 'ECONNABORTED' }, 'ECONNRESET'],
+      [{ code: 'TLS_ERROR' }, 'TLS_ERROR'],
+      [{ code: 'ERR_TLS_CERT_ALTNAME_INVALID' }, 'TLS_ERROR'],
+      [{ code: 'ERR_SSL_WRONG_VERSION_NUMBER' }, 'TLS_ERROR'],
+      [{ code: 'DEPTH_ZERO_SELF_SIGNED_CERT' }, 'TLS_ERROR'],
+      [{ code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' }, 'TLS_ERROR'],
+      [{ code: 'CERT_HAS_EXPIRED' }, 'TLS_ERROR'],
+    ];
+    for (const [errObj, expected] of validSockets) {
+      assert.equal(sanitizeSocketErrorCode(errObj), expected);
+    }
+
+    // Kode PostgreSQL SQLSTATE & kode aplikasi tidak boleh diperlakukan sebagai kode socket
+    const rejectedCodes = ['23505', '23503', '42P01', '08006', '57P01', 'DB_QUERY_ERROR', 'DB_CONSTRAINT_ERROR', 'ROUTEROS_TRAP', 'ROUTEROS_FATAL', 'INTERNAL_ERROR', 'VALIDATION_ERROR'];
+    for (const code of rejectedCodes) {
+      assert.equal(sanitizeSocketErrorCode({ code, message: 'tls ssl certificate handshake' }), 'NETWORK_ERROR');
+    }
+
+    // Pesan error palsu yang hanya berisi kata TLS/SSL tanpa kode TLS valid wajib menjadi NETWORK_ERROR
+    const spoofedTlsMessages = [
+      { message: 'TLS handshake failed with certificate error' },
+      { code: '', message: 'SSL routines: certificate verify failed' },
+      { code: 'UNKNOWN_ERROR', message: 'fake tls ssl certificate handshake' },
+      { code: 'CUSTOM_APP_SSL', message: 'ssl certificate error' },
+    ];
+    for (const fakeErr of spoofedTlsMessages) {
+      assert.equal(
+        sanitizeSocketErrorCode(fakeErr),
+        'NETWORK_ERROR',
+        `Teks pesan palsu tidak boleh menyimpulkan TLS_ERROR: ${JSON.stringify(fakeErr)}`
+      );
+    }
+  });
+
+  // Skenario 47: Validasi UTF-8 ketat & pemeriksaan rekursif JSON pasca-decode (Unicode escape, nested sensitive props, enc:v1, Bearer, & retry sah)
+  await runScenario(47, 'Audit Keamanan Terarah: UTF-8 ketat & inspeksi rekursif SYNC_META_V1 tolak db_password, db\\u005fpassword, nested, enc:v1, Bearer, & invalid UTF-8', async () => {
+    const strToB64 = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
+
+    // 1. Properti sensitif db_password
+    const rawDbPasswordJson = '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"db_password":"SecretDbPass47"}';
+    // 2. Properti sensitif menggunakan JSON Unicode escape: db\u005fpassword & pass\u0077ord
+    const escapedDbPasswordJson = '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"db\\u005fpassword":"EscapedSecret47"}';
+    const escapedPasswordJson = '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"pass\\u0077ord":"EscapedPwd47"}';
+    // 3. Nested property sensitif di dalam stages / nested object
+    const nestedSecretJson = '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"stages":{"nested":{"client\\u005fsecret":"NestedSec47"}}}';
+    // 4. Nilai enc:v1: (polos dan Unicode escape \u0065nc:v1:)
+    const encV1ValueJson = '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"pppoe","username":"\\u0065nc:v1:0123456789abcdef:fedcba98:1122"}]}';
+    // 5. Token Bearer (polos dan Unicode escape)
+    const bearerValueJson = '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"hotspot","username":"\\u0042earer eyJhbGciOiJIUzI1NiJ9.payload.sig"}]}';
+
+    const maliciousJsonPayloads = [
+      { name: 'db_password', b64: strToB64(rawDbPasswordJson) },
+      { name: 'db\\u005fpassword', b64: strToB64(escapedDbPasswordJson) },
+      { name: 'pass\\u0077ord', b64: strToB64(escapedPasswordJson) },
+      { name: 'nested_client_secret', b64: strToB64(nestedSecretJson) },
+      { name: 'enc_v1_escaped', b64: strToB64(encV1ValueJson) },
+      { name: 'bearer_escaped', b64: strToB64(bearerValueJson) },
+    ];
+
+    for (const tc of maliciousJsonPayloads) {
+      const check = parseSyncMetaV1Payload(tc.b64);
+      assert.equal(check.valid, false, `parseSyncMetaV1Payload wajib menolak ${tc.name}`);
+
+      const marker = `[SYNC_META_V1:${tc.b64}]`;
+      const redacted = redactSensitiveText(`Info ${marker}`);
+      assert.ok(!redacted.includes('[SYNC_META_V1:'), `redactSensitiveText harus membuang marker ${tc.name}`);
+
+      const parsed = parsePendingSyncActions('failed', `Gagal ${marker}`);
+      assert.equal(parsed.corrupted, true, `parsePendingSyncActions wajib tandai corrupted untuk ${tc.name}`);
+      assert.equal(parsed.oldAccounts.length, 0);
+    }
+
+    // 6. Byte UTF-8 tidak valid (0xff, 0xc3 0x28, 0x80) ditolak sebelum JSON.parse
+    const invalidUtf8Buf = Buffer.concat([
+      Buffer.from('{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"pppoe","username":"bad_', 'utf8'),
+      Buffer.from([0xff, 0xc3, 0x28, 0x80]),
+      Buffer.from('"}]}', 'utf8'),
+    ]);
+    const invalidUtf8B64 = invalidUtf8Buf.toString('base64url');
+    assert.equal(parseSyncMetaV1Payload(invalidUtf8B64).valid, false, 'Byte UTF-8 tidak valid wajib ditolak');
+    const redactedInvalidUtf8 = redactSensitiveText(`Gagal [SYNC_META_V1:${invalidUtf8B64}]`);
+    assert.ok(!redactedInvalidUtf8.includes('[SYNC_META_V1:'));
+    const parsedInvalidUtf8 = parsePendingSyncActions('failed', `Gagal [SYNC_META_V1:${invalidUtf8B64}]`);
+    assert.equal(parsedInvalidUtf8.corrupted, true);
+    assert.equal(parsedInvalidUtf8.oldAccounts.length, 0);
+
+    // 7. Payload SYNC_META_V1 yang sah tetap diterima dan mekanisme retry end-to-end tetap bekerja
+    await api('POST', '/customers', {
+      id: 'c-sec-47',
+      name: 'Audit Valid Retry 47',
+      phone: '084700',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec47_old',
+      password: 'CustomerSecret47',
+      status: 'active',
+    });
+    const oldSecretId = mockRouter.pppoeSecrets.find((s) => s.name === 'sec47_old')!['.id'];
+    mockRouter.failRemoveIds.add(oldSecretId);
+
+    const updFail = await api('PUT', '/customers/c-sec-47', { username: 'sec47_new' });
+    assert.equal(updFail.status, 200);
+    assert.equal(updFail.json.data.routerSyncStatus, 'failed');
+
+    const syncMsg = updFail.json.data.routerLastSyncMessage as string;
+    const tagMatch = syncMsg.match(/\[SYNC_META_V1:([^\]]+)\]/);
+    assert.ok(tagMatch, 'Marker SYNC_META_V1 sah harus dihasilkan');
+    assert.equal(parseSyncMetaV1Payload(tagMatch[1]).valid, true, 'Marker SYNC_META_V1 sah wajib lolos validasi baru');
+    assert.equal(redactSensitiveText(syncMsg), syncMsg, 'Marker SYNC_META_V1 sah harus dipertahankan utuh oleh sanitizer');
+
+    mockRouter.failRemoveIds.delete(oldSecretId);
+    const retryOk = await api('POST', '/customers/c-sec-47/sync-router');
+    assert.equal(retryOk.status, 200);
+    assert.equal(retryOk.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'sec47_old'), false);
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'sec47_new'), true);
+  });
+
+  // Skenario 48: Penyelarasan daftar kredensial camelCase, snake_case, kebab-case, root & nested JSON, sanitasi teks, serta bebas false positive
+  await runScenario(48, 'Penyempurnaan Keamanan: Konsistensi deteksi camelCase/snake_case di sanitasi teks, nilai meta, & root/nested JSON tanpa false positive', async () => {
+    const strToB64 = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
+
+    const sensitivePropNames = [
+      'password',
+      'passwd',
+      'pwd',
+      'db_password',
+      'dbPassword',
+      'DB_PASSWORD',
+      'mikrotik_encryption_key',
+      'mikrotikEncryptionKey',
+      'MIKROTIK_ENCRYPTION_KEY',
+      'access_token',
+      'accessToken',
+      'refresh_token',
+      'refreshToken',
+      'id_token',
+      'idToken',
+      'auth_token',
+      'authToken',
+      'authorization',
+      'Authorization',
+      'client_secret',
+      'clientSecret',
+      'secret_key',
+      'secretKey',
+      'secret',
+      'api_key',
+      'apiKey',
+      'api-key',
+      'apikey',
+      'ApiKey',
+      'passphrase',
+      'private_key',
+      'privateKey',
+      'credential',
+      'credentials',
+      'Credentials',
+    ];
+
+    // 48a: Root & nested JSON property detection pada parseSyncMetaV1Payload, redactSensitiveText, & parsePendingSyncActions
+    for (let idx = 0; idx < sensitivePropNames.length; idx++) {
+      const prop = sensitivePropNames[idx];
+      const secretVal = `SecVal_${idx}_XYZ`;
+
+      const rootJson = JSON.stringify({
+        v: 1,
+        needsSessionDisconnect: false,
+        oldAccounts: [],
+        [prop]: secretVal,
+      });
+      const rootB64 = strToB64(rootJson);
+      assert.equal(parseSyncMetaV1Payload(rootB64).valid, false, `Root property "${prop}" wajib ditolak`);
+      assert.ok(!redactSensitiveText(`Info [SYNC_META_V1:${rootB64}]`).includes('[SYNC_META_V1:'), `Marker root "${prop}" harus dibuang`);
+      assert.equal(parsePendingSyncActions('failed', `Gagal [SYNC_META_V1:${rootB64}]`).corrupted, true);
+
+      const nestedJson = JSON.stringify({
+        v: 1,
+        needsSessionDisconnect: false,
+        oldAccounts: [],
+        stages: { accountVerified: true, nested: { [prop]: secretVal } },
+      });
+      const nestedB64 = strToB64(nestedJson);
+      assert.equal(parseSyncMetaV1Payload(nestedB64).valid, false, `Nested property "${prop}" wajib ditolak`);
+      assert.ok(!redactSensitiveText(`Info [SYNC_META_V1:${nestedB64}]`).includes('[SYNC_META_V1:'), `Marker nested "${prop}" harus dibuang`);
+      assert.equal(parsePendingSyncActions('failed', `Gagal [SYNC_META_V1:${nestedB64}]`).corrupted, true);
+
+      // 48b: Deteksi konsisten pada redactSensitiveText untuk format JSON & key-value
+      const jsonSample = `{"${prop}":"${secretVal}"}`;
+      const kvSample = `${prop}=${secretVal} ${prop.toUpperCase()}:'${secretVal}_Q'`;
+      const redactedJson = redactSensitiveText(jsonSample);
+      const redactedKv = redactSensitiveText(kvSample);
+      assert.ok(!redactedJson.includes(secretVal), `redactSensitiveText JSON gagal menyensor "${prop}" -> ${redactedJson}`);
+      assert.ok(!redactedKv.includes(secretVal), `redactSensitiveText KV gagal menyensor "${prop}" -> ${redactedKv}`);
+    }
+
+    // 48c: Unicode escape pada camelCase & snake_case di root dan nested JSON + nilai metadata mengandung kredensial camelCase
+    const escapedCases = [
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"db\\u0050assword":"EscCamelDb1"}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"stages":{"nested":{"mikrotik\\u0045ncryptionKey":"EscCamelKey2"}}}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"stages":{"nested":{"private\\u004bey":"EscPrivKey3"}}}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[],"auth\\u0054oken":"EscAuthTok4"}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"pppoe","username":"dbPassword=InlinePass5"}]}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"hotspot","username":"mikrotikEncryptionKey"}]}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"pppoe","username":"authorization: Basic abcdef"}]}',
+      '{"v":1,"needsSessionDisconnect":false,"oldAccounts":[{"type":"pppoe","username":"credentials=user:pass"}]}',
+    ];
+    for (const rawJson of escapedCases) {
+      const b64 = strToB64(rawJson);
+      assert.equal(parseSyncMetaV1Payload(b64).valid, false, `Payload sensitif wajib ditolak: ${rawJson}`);
+      assert.equal(parsePendingSyncActions('failed', `Gagal [SYNC_META_V1:${b64}]`).corrupted, true);
+    }
+
+    // 48d: Bebas false positive untuk field operasional sah & pesan operasional aman
+    const validMeta = {
+      v: 1,
+      needsSessionDisconnect: true,
+      oldAccounts: [{ type: 'pppoe', username: 'pelanggan_01' }],
+      corrupted: false,
+      stages: {
+        accountProvisioned: true,
+        accountVerified: true,
+        oldAccountsPending: 1,
+        sessionDisconnectPending: true,
+      },
+    };
+    const validTag48 = `[SYNC_META_V1:${strToB64(JSON.stringify(validMeta))}]`;
+    const safeOperationalMsg =
+      'Status routerSyncStatus=failed accountVerified=true needsSessionDisconnect=true oldAccounts=1 sessionDisconnectPending=true ' +
+      validTag48;
+    assert.equal(parseSyncMetaV1Payload(validTag48.slice(14, -1)).valid, true, 'Field operasional sah tidak boleh dianggap sensitif');
+    assert.equal(redactSensitiveText(safeOperationalMsg), safeOperationalMsg, 'Field operasional sah tidak boleh terkena false positive redaksi');
+    const parsedSafe48 = parsePendingSyncActions('failed', safeOperationalMsg);
+    assert.equal(parsedSafe48.corrupted, false);
+    assert.equal(parsedSafe48.needsSessionDisconnect, true);
+    assert.deepEqual(parsedSafe48.oldAccounts, [{ type: 'pppoe', username: 'pelanggan_01' }]);
   });
 
   // Restore prototypes & stop servers cleanly

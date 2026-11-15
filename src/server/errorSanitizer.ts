@@ -65,18 +65,78 @@ export type AllowedSocketErrorCode = (typeof ALLOWED_SOCKET_ERROR_CODES)[number]
 
 const ALLOWED_SOCKET_CODE_SET = new Set<string>(ALLOWED_SOCKET_ERROR_CODES);
 
-const FATAL_ERROR_CODES = new Set<AllowedErrorCode>(['ROUTEROS_FATAL']);
+export const FATAL_ERROR_CODES = new Set<AllowedErrorCode>(['ROUTEROS_FATAL']);
 
 const MAX_SAFE_MESSAGE_LENGTH = 320;
 const MAX_LOG_CONTEXT_LENGTH = 80;
 const MAX_LOG_OPERATION_LENGTH = 24;
 const MAX_LOG_RESOURCE_ID_LENGTH = 64;
 
-const SENSITIVE_KEY_ALT =
-  'password|passwd|pwd|access_token|refresh_token|id_token|token|client_secret|secret_key|secret|api_key|api-key|apikey|passphrase|private_key';
+export const MAX_SYNC_META_V1_B64_LENGTH = 2000;
+export const MAX_SYNC_META_V1_DECODED_BYTES = 1536;
+export const MAX_SYNC_META_V1_OLD_ACCOUNTS = 10;
+export const MAX_SYNC_META_V1_USERNAME_LENGTH = 64;
 
-const SYNC_META_V1_SPLIT_REGEX = /(\[SYNC_META_V1:[A-Za-z0-9_-]+\])/g;
-const SYNC_META_V1_EXACT_REGEX = /^\[SYNC_META_V1:[A-Za-z0-9_-]+\]$/;
+const ALLOWED_SYNC_META_TOP_KEYS = new Set([
+  'v',
+  'needsSessionDisconnect',
+  'oldAccounts',
+  'corrupted',
+  'stages',
+]);
+const ALLOWED_SYNC_META_ACCOUNT_KEYS = new Set(['type', 'username']);
+const ALLOWED_SYNC_META_STAGE_KEYS = new Set([
+  'accountProvisioned',
+  'accountVerified',
+  'oldAccountsPending',
+  'sessionDisconnectPending',
+]);
+
+const KNOWN_TLS_ERROR_CODES = new Set([
+  'TLS_ERROR',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'CERT_NOT_YET_VALID',
+  'CERT_HAS_EXPIRED',
+  'CERT_REVOKED',
+  'CERT_CHAIN_TOO_LONG',
+  'CERT_UNTRUSTED',
+  'CERT_REJECTED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'INVALID_PURPOSE',
+]);
+
+const UNIFIED_SENSITIVE_KEY_PATTERNS = [
+  'mikrotik[_-]?encryption[_-]?keys?',
+  'encryption[_-]?keys?',
+  'db[_-]?passwords?',
+  'access[_-]?tokens?',
+  'refresh[_-]?tokens?',
+  'auth[_-]?tokens?',
+  'id[_-]?tokens?',
+  'authorization',
+  'client[_-]?secrets?',
+  'secret[_-]?keys?',
+  'private[_-]?keys?',
+  'api[_-]?keys?',
+  'credentials?',
+  'passphrase',
+  'passwords?',
+  'passwd',
+  'secrets?',
+  'tokens?',
+  'pwd',
+] as const;
+
+const SENSITIVE_KEY_ALT = UNIFIED_SENSITIVE_KEY_PATTERNS.join('|');
+const SENSITIVE_PROP_BOUNDARY_REGEX = new RegExp(`(?:^|[_-])(${SENSITIVE_KEY_ALT})(?:$|[_-])`, 'i');
+const SENSITIVE_META_VALUE_KV_REGEX = new RegExp(`\\b(${SENSITIVE_KEY_ALT})\\b["']?\\s*[=:]`, 'i');
+const SENSITIVE_META_VALUE_KEYWORD_REGEX = /\b(mikrotik[_-]?encryption[_-]?keys?|db[_-]?passwords?)\b/i;
+
+const SYNC_META_V1_SPLIT_REGEX = /(\[SYNC_META_V1:[^\]]*\])/g;
+const SYNC_META_V1_CAPTURE_REGEX = /^\[SYNC_META_V1:([^\]]*)\]$/;
 
 function getActiveEnvSecrets(): string[] {
   const candidates = new Set<string>();
@@ -158,7 +218,7 @@ function redactTextSegment(segment: string): string {
   text = text.replace(kvQuotedRegex, '$1$2[REDACTED]');
 
   const kvUnquotedRegex = new RegExp(
-    `\\b(${SENSITIVE_KEY_ALT})\\b\\s*([=:])\\s*([^\\s,&;)}\\]'"]+)`,
+    `\\b(${SENSITIVE_KEY_ALT})\\b\\s*([=:])\\s*(?!Bearer\\s+\\[REDACTED\\]|\\[REDACTED(?:_CREDENTIAL)?\\])([^\\s,&;)}\\]'"]+)`,
     'gi'
   );
   text = text.replace(kvUnquotedRegex, '$1$2[REDACTED]');
@@ -180,9 +240,268 @@ function redactTextSegment(segment: string): string {
   return text;
 }
 
+export interface ValidatedSyncMetaOldAccount {
+  type: 'pppoe' | 'hotspot';
+  username: string;
+}
+
+export interface ValidatedSyncMetaStages {
+  accountProvisioned?: boolean;
+  accountVerified?: boolean;
+  oldAccountsPending?: number;
+  sessionDisconnectPending?: boolean;
+}
+
+export interface ValidatedSyncMetaPayloadV1 {
+  v: 1;
+  needsSessionDisconnect: boolean;
+  oldAccounts: ValidatedSyncMetaOldAccount[];
+  corrupted?: boolean;
+  stages?: ValidatedSyncMetaStages;
+}
+
+const MAX_SYNC_META_V1_RECURSION_DEPTH = 6;
+const MAX_SYNC_META_V1_TOTAL_NODES = 120;
+
+function isSensitiveMetaPropertyName(key: string): boolean {
+  if (SENSITIVE_PROP_BOUNDARY_REGEX.test(key)) {
+    return true;
+  }
+  const normalizedSnake = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
+  return SENSITIVE_PROP_BOUNDARY_REGEX.test(normalizedSnake);
+}
+
+function containsCredentialInMetaValue(raw: string): boolean {
+  if (/enc:v1:/i.test(raw)) return true;
+  if (/postgres(?:ql)?:\/\//i.test(raw)) return true;
+  if (/\bBearer\s+\S+/i.test(raw)) return true;
+  if (SENSITIVE_META_VALUE_KV_REGEX.test(raw)) return true;
+  if (SENSITIVE_META_VALUE_KEYWORD_REGEX.test(raw)) return true;
+  for (const secret of getActiveEnvSecrets()) {
+    if (raw.includes(secret)) return true;
+  }
+  return false;
+}
+
+function decodeStrictUtf8(buf: Buffer): string | null {
+  try {
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const decoded = decoder.decode(buf);
+    if (!Buffer.from(decoded, 'utf8').equals(buf)) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function inspectDecodedMetaSecurity(root: unknown): { safe: true } | { safe: false; reason: string } {
+  let visitedNodes = 0;
+
+  const walk = (node: unknown, depth: number): { safe: true } | { safe: false; reason: string } => {
+    if (depth > MAX_SYNC_META_V1_RECURSION_DEPTH) {
+      return { safe: false, reason: 'Kedalaman struktur JSON penanda [SYNC_META_V1] melebihi batas aman.' };
+    }
+    visitedNodes++;
+    if (visitedNodes > MAX_SYNC_META_V1_TOTAL_NODES) {
+      return { safe: false, reason: 'Jumlah elemen pada penanda [SYNC_META_V1] melebihi batas aman.' };
+    }
+
+    if (typeof node === 'string') {
+      if (/[\x00-\x1F\x7F\u2028\u2029]/.test(node)) {
+        return { safe: false, reason: 'Penanda [SYNC_META_V1] mengandung karakter kontrol terlarang.' };
+      }
+      if (containsCredentialInMetaValue(node)) {
+        return { safe: false, reason: 'Penanda [SYNC_META_V1] mengandung pola kredensial terlarang.' };
+      }
+      return { safe: true };
+    }
+
+    if (node === null || typeof node === 'number' || typeof node === 'boolean') {
+      return { safe: true };
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const res = walk(item, depth + 1);
+        if (!res.safe) return res;
+      }
+      return { safe: true };
+    }
+
+    if (typeof node === 'object') {
+      for (const key of Object.keys(node as Record<string, unknown>)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+          return { safe: false, reason: 'Penanda [SYNC_META_V1] mengandung properti prototipe terlarang.' };
+        }
+        if (isSensitiveMetaPropertyName(key)) {
+          return { safe: false, reason: 'Penanda [SYNC_META_V1] mengandung nama properti sensitif terlarang.' };
+        }
+        const res = walk((node as Record<string, unknown>)[key], depth + 1);
+        if (!res.safe) return res;
+      }
+      return { safe: true };
+    }
+
+    return { safe: false, reason: 'Tipe nilai pada penanda [SYNC_META_V1] tidak valid.' };
+  };
+
+  return walk(root, 0);
+}
+
+/**
+ * Validasi ketat struktur, ukuran, Base64URL, UTF-8 ketat, properti yang diizinkan,
+ * dan kebersihan kredensial rekursif pada payload [SYNC_META_V1:<rawB64>].
+ */
+export function parseSyncMetaV1Payload(
+  rawB64: unknown
+): { valid: true; payload: ValidatedSyncMetaPayloadV1 } | { valid: false; reason: string } {
+  if (typeof rawB64 !== 'string') {
+    return { valid: false, reason: 'Payload penanda [SYNC_META_V1] harus berupa string.' };
+  }
+  const trimmed = rawB64.trim();
+  if (!trimmed || trimmed.length > MAX_SYNC_META_V1_B64_LENGTH) {
+    return { valid: false, reason: 'Ukuran penanda [SYNC_META_V1] kosong atau melebihi batas aman.' };
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    return { valid: false, reason: 'Payload Base64URL pada penanda [SYNC_META_V1] tidak valid.' };
+  }
+
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(trimmed, 'base64url');
+  } catch {
+    return { valid: false, reason: 'Gagal mendekode Base64URL penanda [SYNC_META_V1].' };
+  }
+
+  if (buf.length === 0 || buf.length > MAX_SYNC_META_V1_DECODED_BYTES || buf.toString('base64url') !== trimmed) {
+    return { valid: false, reason: 'Encoding Base64URL atau ukuran terdekode [SYNC_META_V1] tidak valid.' };
+  }
+
+  const jsonStr = decodeStrictUtf8(buf);
+  if (jsonStr === null) {
+    return { valid: false, reason: 'Byte UTF-8 pada penanda [SYNC_META_V1] tidak valid.' };
+  }
+  if (/[\x00-\x1F\x7F\u2028\u2029]/.test(jsonStr)) {
+    return { valid: false, reason: 'Penanda [SYNC_META_V1] mengandung karakter kontrol terlarang.' };
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch {
+    return { valid: false, reason: 'Gagal membaca JSON dari penanda [SYNC_META_V1].' };
+  }
+
+  const securityCheck = inspectDecodedMetaSecurity(parsed);
+  if (!securityCheck.safe) {
+    return { valid: false, reason: securityCheck.reason };
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { valid: false, reason: 'Struktur JSON penanda [SYNC_META_V1] bukan objek.' };
+  }
+
+  for (const key of Object.keys(parsed)) {
+    if (!ALLOWED_SYNC_META_TOP_KEYS.has(key)) {
+      return { valid: false, reason: 'Penanda [SYNC_META_V1] mengandung properti asing yang ditolak.' };
+    }
+  }
+
+  if (parsed.v !== 1 || typeof parsed.needsSessionDisconnect !== 'boolean' || !Array.isArray(parsed.oldAccounts)) {
+    return { valid: false, reason: 'Struktur JSON penanda [SYNC_META_V1] tidak valid atau versi tidak dikenali.' };
+  }
+
+  if (parsed.corrupted !== undefined && typeof parsed.corrupted !== 'boolean') {
+    return { valid: false, reason: 'Nilai properti corrupted pada [SYNC_META_V1] tidak valid.' };
+  }
+
+  if (parsed.oldAccounts.length > MAX_SYNC_META_V1_OLD_ACCOUNTS) {
+    return { valid: false, reason: 'Jumlah oldAccounts pada penanda [SYNC_META_V1] melebihi batas aman.' };
+  }
+
+  const cleanOldAccounts: ValidatedSyncMetaOldAccount[] = [];
+  for (const item of parsed.oldAccounts) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return { valid: false, reason: 'Entri akun lama pada penanda [SYNC_META_V1] rusak.' };
+    }
+    const itemKeys = Object.keys(item);
+    if (itemKeys.length !== 2 || !itemKeys.every((k) => ALLOWED_SYNC_META_ACCOUNT_KEYS.has(k))) {
+      return { valid: false, reason: 'Entri akun lama pada [SYNC_META_V1] memiliki properti tidak sah.' };
+    }
+    if (item.type !== 'pppoe' && item.type !== 'hotspot') {
+      return { valid: false, reason: 'Jenis akun lama pada [SYNC_META_V1] tidak dikenali.' };
+    }
+    if (typeof item.username !== 'string' || /[\x00-\x1F\x7F\u2028\u2029]/.test(item.username)) {
+      return { valid: false, reason: 'Username akun lama pada [SYNC_META_V1] tidak valid.' };
+    }
+    const cleanUser = item.username.trim();
+    if (cleanUser.length < 1 || cleanUser.length > MAX_SYNC_META_V1_USERNAME_LENGTH) {
+      return { valid: false, reason: 'Panjang username pada penanda [SYNC_META_V1] melanggar batas.' };
+    }
+    if (containsCredentialInMetaValue(cleanUser)) {
+      return { valid: false, reason: 'Username pada [SYNC_META_V1] mengandung pola kredensial terlarang.' };
+    }
+    cleanOldAccounts.push({ type: item.type, username: cleanUser });
+  }
+
+  let cleanStages: ValidatedSyncMetaStages | undefined;
+  if (parsed.stages !== undefined) {
+    if (!parsed.stages || typeof parsed.stages !== 'object' || Array.isArray(parsed.stages)) {
+      return { valid: false, reason: 'Properti stages pada [SYNC_META_V1] tidak valid.' };
+    }
+    for (const sKey of Object.keys(parsed.stages)) {
+      if (!ALLOWED_SYNC_META_STAGE_KEYS.has(sKey)) {
+        return { valid: false, reason: 'Properti stages pada [SYNC_META_V1] mengandung field asing.' };
+      }
+    }
+    const st = parsed.stages;
+    if (st.accountProvisioned !== undefined && typeof st.accountProvisioned !== 'boolean') {
+      return { valid: false, reason: 'Field accountProvisioned pada stages tidak valid.' };
+    }
+    if (st.accountVerified !== undefined && typeof st.accountVerified !== 'boolean') {
+      return { valid: false, reason: 'Field accountVerified pada stages tidak valid.' };
+    }
+    if (st.sessionDisconnectPending !== undefined && typeof st.sessionDisconnectPending !== 'boolean') {
+      return { valid: false, reason: 'Field sessionDisconnectPending pada stages tidak valid.' };
+    }
+    if (
+      st.oldAccountsPending !== undefined &&
+      (typeof st.oldAccountsPending !== 'number' ||
+        !Number.isInteger(st.oldAccountsPending) ||
+        st.oldAccountsPending < 0 ||
+        st.oldAccountsPending > MAX_SYNC_META_V1_OLD_ACCOUNTS)
+    ) {
+      return { valid: false, reason: 'Field oldAccountsPending pada stages tidak valid.' };
+    }
+    cleanStages = {
+      ...(st.accountProvisioned !== undefined ? { accountProvisioned: st.accountProvisioned } : {}),
+      ...(st.accountVerified !== undefined ? { accountVerified: st.accountVerified } : {}),
+      ...(st.oldAccountsPending !== undefined ? { oldAccountsPending: st.oldAccountsPending } : {}),
+      ...(st.sessionDisconnectPending !== undefined
+        ? { sessionDisconnectPending: st.sessionDisconnectPending }
+        : {}),
+    };
+  }
+
+  return {
+    valid: true,
+    payload: {
+      v: 1,
+      needsSessionDisconnect: parsed.needsSessionDisconnect,
+      oldAccounts: cleanOldAccounts,
+      ...(parsed.corrupted !== undefined ? { corrupted: parsed.corrupted } : {}),
+      ...(cleanStages ? { stages: cleanStages } : {}),
+    },
+  };
+}
+
 /**
  * Membersihkan teks dari potensi kebocoran kredensial, ciphertext, URI DB, atau stack trace.
- * Tetap mempertahankan penanda terstruktur [SYNC_META_V1:...] secara utuh.
+ * Tetap mempertahankan penanda terstruktur [SYNC_META_V1:...] yang valid secara skema & ukuran.
  */
 export function redactSensitiveText(input: unknown): string {
   if (typeof input !== 'string') return '';
@@ -191,8 +510,10 @@ export function redactSensitiveText(input: unknown): string {
   const parts = input.split(SYNC_META_V1_SPLIT_REGEX);
   const cleanedParts = parts.map((part) => {
     if (!part) return '';
-    if (SYNC_META_V1_EXACT_REGEX.test(part)) {
-      return part;
+    const markerMatch = part.match(SYNC_META_V1_CAPTURE_REGEX);
+    if (markerMatch) {
+      const check = parseSyncMetaV1Payload(markerMatch[1]);
+      return check.valid ? part : '[INVALID_SYNC_META]';
     }
     return redactTextSegment(part);
   });
@@ -299,9 +620,7 @@ export class SafeOperationalError extends Error {
         ? options.statusCode
         : 400;
 
-    const isAllowedFatalCode = FATAL_ERROR_CODES.has(validatedCode);
-    const isValidFatalOption = options?.isFatal === true && ALLOWED_CODE_SET.has(String(code));
-    this.isFatal = isAllowedFatalCode || isValidFatalOption;
+    this.isFatal = FATAL_ERROR_CODES.has(validatedCode);
   }
 
   override toString(): string {
@@ -315,7 +634,8 @@ export function isSafeOperationalError(err: unknown): err is SafeOperationalErro
 
 export function isFatalMikrotikError(err: unknown): boolean {
   if (isSafeOperationalError(err)) {
-    return Boolean(err.isFatal) || err.code === 'ROUTEROS_FATAL';
+    const validatedCode = toAllowedErrorCode(err.code);
+    return FATAL_ERROR_CODES.has(validatedCode) && err.isFatal === true;
   }
   return false;
 }
@@ -332,38 +652,24 @@ export function toAllowedErrorCode(
 
 /**
  * Memetakan error socket TCP/TLS ke allowlist kode jaringan/socket/TLS terpisah.
- * Kode non-socket (mis. DB_QUERY_ERROR, ROUTEROS_TRAP, INTERNAL_ERROR) tidak pernah
- * dianggap sebagai kode socket dan dipetakan ke NETWORK_ERROR.
+ * Hanya mempercayai err.code (bukan teks err.message yang tidak tepercaya).
+ * Kode non-socket (DB/SQLSTATE/aplikasi/RouterOS) tidak pernah dianggap kode socket.
  */
 export function sanitizeSocketErrorCode(err: any): AllowedSocketErrorCode {
   const rawCode = typeof err?.code === 'string' ? err.code.trim().toUpperCase() : '';
-  if (rawCode && ALLOWED_SOCKET_CODE_SET.has(rawCode)) {
+  if (!rawCode) {
+    return 'NETWORK_ERROR';
+  }
+  if (ALLOWED_SOCKET_CODE_SET.has(rawCode)) {
     return rawCode as AllowedSocketErrorCode;
   }
   if (rawCode === 'ECONNABORTED') {
     return 'ECONNRESET';
   }
   if (
-    rawCode.startsWith('ERR_TLS') ||
-    rawCode.startsWith('ERR_SSL') ||
-    rawCode.includes('CERT') ||
-    rawCode.includes('TLS') ||
-    rawCode.includes('SSL')
-  ) {
-    return 'TLS_ERROR';
-  }
-
-  // Jangan gunakan pesan err jika rawCode jelas berasal dari kategori non-socket (DB/RouterOS/Internal)
-  if (rawCode && (ALLOWED_CODE_SET.has(rawCode) || /^[0-9A-Z]{5}$/.test(rawCode))) {
-    return 'NETWORK_ERROR';
-  }
-
-  const msg = typeof err?.message === 'string' ? err.message.toLowerCase() : '';
-  if (
-    msg.includes('tls') ||
-    msg.includes('ssl') ||
-    msg.includes('certificate') ||
-    msg.includes('handshake')
+    KNOWN_TLS_ERROR_CODES.has(rawCode) ||
+    rawCode.startsWith('ERR_TLS_') ||
+    rawCode.startsWith('ERR_SSL_')
   ) {
     return 'TLS_ERROR';
   }
@@ -483,7 +789,7 @@ export function sanitizeMikrotikError(
     return {
       code: safeCode,
       message: sanitizeSafeFallbackMessage(err.safeMessage, safeFallback),
-      isFatal: Boolean(err.isFatal) || safeCode === 'ROUTEROS_FATAL',
+      isFatal: FATAL_ERROR_CODES.has(safeCode) && err.isFatal === true,
     };
   }
 
