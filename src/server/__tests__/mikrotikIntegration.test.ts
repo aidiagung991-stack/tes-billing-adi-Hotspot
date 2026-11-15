@@ -567,14 +567,20 @@ class MockRouterOsServer {
 class MockPostgresStore {
   routerPort = 8728;
   routerPasswordEncrypted = '';
+  routerLastStatusMessage: string | null = null;
   packages = new Map<string, MockPackageRow>();
   customers = new Map<string, MockCustomerRow>();
+  invoices = new Map<string, any>();
+  injectErrorOnPattern: { pattern: RegExp; error: any } | null = null;
 
   reset(routerPort: number, routerPasswordEncrypted: string) {
     this.routerPort = routerPort;
     this.routerPasswordEncrypted = routerPasswordEncrypted;
+    this.routerLastStatusMessage = null;
     this.packages.clear();
     this.customers.clear();
+    this.invoices.clear();
+    this.injectErrorOnPattern = null;
 
     this.packages.set('pkg-10m', {
       id: 'pkg-10m',
@@ -628,8 +634,25 @@ class MockPostgresStore {
   handleQuery(sql: string, params: any[] = []): { rows: any[]; rowCount: number } {
     const q = sql.replace(/\s+/g, ' ').trim();
 
+    if (this.injectErrorOnPattern && this.injectErrorOnPattern.pattern.test(q)) {
+      throw this.injectErrorOnPattern.error;
+    }
+
     if (q === 'BEGIN' || q === 'COMMIT' || q === 'ROLLBACK' || q === 'SELECT 1 AS healthcheck') {
       return { rows: [{ healthcheck: 1 }], rowCount: 1 };
+    }
+
+    if (q.startsWith('SELECT pg_advisory_xact_lock')) {
+      return { rows: [{ pg_advisory_xact_lock: '' }], rowCount: 1 };
+    }
+
+    if (q.startsWith('SELECT * FROM invoices WHERE id = $1 FOR UPDATE')) {
+      const inv = this.invoices.get(params[0]);
+      return { rows: inv ? [{ ...inv }] : [], rowCount: inv ? 1 : 0 };
+    }
+
+    if (q.startsWith('SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments')) {
+      return { rows: [{ total_paid: 0 }], rowCount: 1 };
     }
 
     if (q.includes('FROM information_schema.columns')) {
@@ -640,6 +663,30 @@ class MockPostgresStore {
         return { rows: [{ column_name: 'pppoe_profile' }], rowCount: 1 };
       }
       return { rows: [], rowCount: 0 };
+    }
+
+    if (q.includes('FROM mikrotik_settings') && q.includes('AS "isPasswordConfigured"')) {
+      return {
+        rows: [
+          {
+            id: 'default',
+            routerName: 'MockRB4011',
+            host: '127.0.0.1',
+            apiPort: this.routerPort,
+            username: 'admin',
+            status: 'disconnected',
+            modelTarget: 'RB4011iGS+RM',
+            rosVersionPreview: 'RouterOS v7.14',
+            useSsl: false,
+            timeoutSeconds: 5,
+            notes: '',
+            lastTestedAt: null,
+            lastStatusMessage: this.routerLastStatusMessage,
+            isPasswordConfigured: Boolean(this.routerPasswordEncrypted),
+          },
+        ],
+        rowCount: 1,
+      };
     }
 
     if (q.includes('FROM mikrotik_settings')) {
@@ -657,6 +704,16 @@ class MockPostgresStore {
         ],
         rowCount: 1,
       };
+    }
+
+    if (q.startsWith('UPDATE mikrotik_settings')) {
+      this.routerLastStatusMessage = params[0] || null;
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (q.includes('FROM customers c WHERE c.is_deleted IS NOT TRUE')) {
+      const list = [...this.customers.values()].filter((c) => !c.is_deleted).map((c) => this.mapReturningRow(c));
+      return { rows: list, rowCount: list.length };
     }
 
     if (q.startsWith('SELECT pppoe_profile, hotspot_profile FROM packages WHERE id = $1')) {
@@ -797,13 +854,14 @@ async function main() {
     };
   };
 
-  const { encryptMikrotikPassword } = await import('../cryptoUtils.js');
+  const { encryptMikrotikPassword, decryptMikrotikPassword } = await import('../cryptoUtils.js');
   const {
     testMikrotikConnection,
     disconnectPppoeSession,
     disconnectHotspotSession,
     createOrUpdatePppoeSecret,
   } = await import('../mikrotikService.js');
+  const { ALLOWED_ERROR_CODES, sanitizeSocketErrorCode, redactSensitiveText } = await import('../errorSanitizer.js');
   const dbRoutesModule = await import('../dbRoutes.js');
   const { parsePendingSyncActions } = dbRoutesModule;
 
@@ -1819,6 +1877,250 @@ async function main() {
     assert.equal(timeoutConn.success, false);
     assert.equal(timeoutConn.errorDetails, 'ETIMEDOUT');
     mockRouter.hangOnCommand.clear();
+  });
+
+  // ==========================================================================
+  // PENGUJIAN REGRESI KEAMANAN & SANITASI ERROR (SKENARIO 31-36)
+  // ==========================================================================
+
+  // Skenario 31: !trap RouterOS yang mengandung kata "password" tidak pernah bocor ke API response atau router_last_sync_message
+  await runScenario(31, 'Audit Keamanan: !trap RouterOS mengandung "password" tidak bocor ke response API maupun router_last_sync_message', async () => {
+    const trapSecret = 'password=LEAKED_TRAP_PASSWORD_999';
+    mockRouter.trapOnCommand.set('/login', `cannot log in: wrong ${trapSecret}`);
+    const testRes = await api('POST', '/mikrotik/test-connection', {});
+    assert.equal(testRes.status, 200);
+    assert.equal(testRes.json.success, false);
+    assert.ok(!testRes.rawText.includes('LEAKED_TRAP_PASSWORD_999'), 'Pesan !trap login bocor ke response!');
+    assert.ok(!testRes.rawText.includes('password='), 'Pesan mentah !trap login bocor ke response!');
+    assert.ok(ALLOWED_ERROR_CODES.includes(testRes.json.errorDetails), `errorDetails harus allowlist: ${testRes.json.errorDetails}`);
+
+    // Uji juga !trap dengan "password" saat provisioning/update pelanggan
+    mockRouter.trapOnCommand.clear();
+    await api('POST', '/customers', {
+      id: 'c-sec-31',
+      name: 'Audit Trap',
+      phone: '083100',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec_trap31',
+      password: 'CustomerSecret31',
+      status: 'active',
+    });
+    mockRouter.trapOnCommand.set('/ppp/secret/set', `invalid parameter ${trapSecret} internal_debug`);
+    const updRes = await api('PUT', '/customers/c-sec-31', { packageId: 'pkg-20m', packageName: 'Paket 20 Mbps' });
+    assert.equal(updRes.status, 200);
+    assert.equal(updRes.json.data.routerSyncStatus, 'failed');
+    assert.ok(!updRes.rawText.includes('LEAKED_TRAP_PASSWORD_999'), '!trap /ppp/secret/set bocor ke API!');
+    const dbMsg = dbStore.customers.get('c-sec-31')?.router_last_sync_message || '';
+    assert.ok(!dbMsg.includes('LEAKED_TRAP_PASSWORD_999'), '!trap /ppp/secret/set bocor ke router_last_sync_message!');
+    assert.ok(!dbMsg.includes('internal_debug'), 'Pesan internal RouterOS tidak boleh disimpan di router_last_sync_message!');
+    assertNoPlaintextLeak(updRes.rawText, dbStore.customers.get('c-sec-31'), 'CustomerSecret31');
+  });
+
+  // Skenario 32: !fatal RouterOS yang mengandung kata "token" tidak pernah bocor ke API response, error, atau router_last_sync_message
+  await runScenario(32, 'Audit Keamanan: !fatal RouterOS mengandung "token" tidak bocor ke response, error, maupun router_last_sync_message', async () => {
+    const fatalSecret = 'session invalidated token=SECRET_ADMIN_TOKEN_777';
+    mockRouter.fatalOnCommand.set('/login', fatalSecret);
+    const testRes = await api('POST', '/mikrotik/test-connection', {});
+    assert.equal(testRes.status, 200);
+    assert.equal(testRes.json.success, false);
+    assert.equal(testRes.json.errorDetails, 'ROUTEROS_FATAL');
+    assert.ok(!testRes.rawText.includes('SECRET_ADMIN_TOKEN_777'), 'Pesan !fatal login bocor!');
+    assert.ok(!testRes.rawText.includes('token='), 'Pesan mentah token !fatal login bocor!');
+
+    mockRouter.fatalOnCommand.clear();
+    await api('POST', '/customers', {
+      id: 'c-sec-32',
+      name: 'Audit Fatal',
+      phone: '083200',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec_fatal32',
+      password: 'CustomerSecret32',
+      status: 'active',
+    });
+
+    mockRouter.fatalOnCommand.set('/ppp/secret/set', fatalSecret);
+    const syncRes = await api('POST', '/customers/c-sec-32/sync-router');
+    assert.equal(syncRes.status, 500);
+    assert.equal(syncRes.json.success, false);
+    assert.equal(syncRes.json.data.routerSyncStatus, 'failed');
+    assert.ok(!syncRes.rawText.includes('SECRET_ADMIN_TOKEN_777'), '!fatal command bocor ke response!');
+    const dbMsg = dbStore.customers.get('c-sec-32')?.router_last_sync_message || '';
+    assert.ok(!dbMsg.includes('SECRET_ADMIN_TOKEN_777'), '!fatal command bocor ke router_last_sync_message!');
+    assertNoPlaintextLeak(syncRes.rawText, dbStore.customers.get('c-sec-32'), 'CustomerSecret32');
+  });
+
+  // Skenario 33: Error soket mengandung pesan sensitif tidak bocor & hanya memakai kode error allowlist
+  await runScenario(33, 'Audit Keamanan: Error soket sensitif disanitasi dan errorDetails selalu berasal dari allowlist', async () => {
+    const sensitiveSocketErr = Object.assign(
+      new Error('connect ECONNREFUSED 10.250.99.88:8728 secret_internal_tunnel_token=XYZ123'),
+      { code: 'ECONNREFUSED' }
+    );
+    const mappedCode = sanitizeSocketErrorCode(sensitiveSocketErr);
+    assert.equal(mappedCode, 'ECONNREFUSED');
+    assert.ok(ALLOWED_ERROR_CODES.includes(mappedCode));
+
+    const unknownSocketErr = Object.assign(
+      new Error('Weird internal socket failure with password=RAW_SOCK_SECRET'),
+      { code: 'WEIRD_NON_ALLOWLIST_CODE' }
+    );
+    assert.equal(sanitizeSocketErrorCode(unknownSocketErr), 'NETWORK_ERROR');
+
+    // Simulasi soket offline pada testMikrotikConnection via endpoint API
+    mockRouter.offline = true;
+    const offRes = await api('POST', '/mikrotik/test-connection', {});
+    assert.equal(offRes.status, 200);
+    assert.equal(offRes.json.success, false);
+    assert.ok(ALLOWED_ERROR_CODES.includes(offRes.json.errorDetails), 'errorDetails wajib masuk allowlist');
+    assert.ok(!offRes.rawText.includes('router_secret_123'), 'Password router bocor saat error soket!');
+  });
+
+  // Skenario 34: Error PostgreSQL (SQL, nama tabel internal, SQLSTATE, stack trace) tidak bocor, namun error validasi aman tetap jelas
+  await runScenario(34, 'Audit Keamanan: Error PostgreSQL tidak bocor ke response API & validasi aman tetap informatif', async () => {
+    // 34a: Injeksi error PG mentah pada GET /customers
+    const pgErr: any = new Error(
+      'relation "internal_billing_secrets_v2" does not exist in query SELECT password_encrypted FROM mikrotik_settings WHERE host=\'10.8.0.1\'\n    at Parser.parseErrorMessage (/app/node_modules/pg-protocol/dist/parser.js:287:98)'
+    );
+    pgErr.code = '42P01';
+    pgErr.severity = 'ERROR';
+    dbStore.injectErrorOnPattern = { pattern: /FROM customers c/i, error: pgErr };
+
+    const custErrRes = await api('GET', '/customers');
+    assert.equal(custErrRes.status, 500);
+    assert.equal(custErrRes.json.success, false);
+    assert.equal(custErrRes.json.errorCode, 'DB_QUERY_ERROR');
+    assert.ok(!custErrRes.rawText.includes('internal_billing_secrets_v2'), 'Nama tabel/pesan PG mentah bocor!');
+    assert.ok(!custErrRes.rawText.includes('SELECT password_encrypted'), 'Query SQL mentah bocor!');
+    assert.ok(!custErrRes.rawText.includes('pg-protocol'), 'Stack trace bocor!');
+
+    // 34b: Injeksi error PG mentah pada POST /customers/:id/sync-router -> tidak bocor ke response & tidak bocor ke router_last_sync_message
+    dbStore.injectErrorOnPattern = null;
+    await api('POST', '/customers', {
+      id: 'c-sec-34',
+      name: 'Audit DB Fail',
+      phone: '083400',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec_db34',
+      password: 'CustomerSecret34',
+      status: 'active',
+    });
+    const pgSyncErr: any = new Error(
+      'connection to server at "db-internal.prod.local" (10.10.10.50), port 5432 failed: password authentication failed for user "pgadmin"\n    at TCPConnectWrap.afterConnect'
+    );
+    pgSyncErr.code = '08006';
+    pgSyncErr.severity = 'FATAL';
+    dbStore.injectErrorOnPattern = { pattern: /SELECT pppoe_profile, hotspot_profile FROM packages/i, error: pgSyncErr };
+
+    const syncDbFail = await api('POST', '/customers/c-sec-34/sync-router');
+    assert.equal(syncDbFail.status, 500);
+    assert.equal(syncDbFail.json.errorCode, 'DB_CONNECTION_ERROR');
+    assert.equal(syncDbFail.json.data.routerSyncStatus, 'failed');
+    assert.ok(!syncDbFail.rawText.includes('db-internal.prod.local'), 'Host DB internal bocor!');
+    assert.ok(!syncDbFail.rawText.includes('pgadmin'), 'User DB internal bocor!');
+    assert.ok(!syncDbFail.rawText.includes('TCPConnectWrap'), 'Stack trace DB bocor!');
+    dbStore.injectErrorOnPattern = null;
+
+    // 34c: Error validasi bisnis aman pada POST /payments tetap jelas untuk admin, sedangkan error PG di /payments disanitasi
+    const safePayValidation = await api('POST', '/payments', {
+      invoiceId: 'inv-tidak-ada',
+      amount: 100000,
+    });
+    assert.equal(safePayValidation.status, 400);
+    assert.equal(safePayValidation.json.message, 'Tagihan tidak ditemukan dalam sistem.');
+
+    dbStore.injectErrorOnPattern = { pattern: /FROM invoices WHERE id = \$1 FOR UPDATE/i, error: pgErr };
+    const pgPayFail = await api('POST', '/payments', {
+      invoiceId: 'inv-001',
+      amount: 100000,
+    });
+    assert.equal(pgPayFail.status, 500);
+    assert.equal(pgPayFail.json.errorCode, 'DB_QUERY_ERROR');
+    assert.ok(!pgPayFail.rawText.includes('internal_billing_secrets_v2'), 'Pesan PG pada POST /payments bocor!');
+  });
+
+  // Skenario 35: Respons API tidak pernah mengandung password pelanggan, password router, ciphertext enc:v1, token, atau stack trace
+  await runScenario(35, 'Audit Keamanan: Respons API & DB sync message bebas dari password, ciphertext enc:v1, token, & stack trace, serta enkripsi AES-256-GCM utuh', async () => {
+    const custPwd = 'UltraSecretCustPass#2026!';
+    const routerPwd = 'router_secret_123';
+
+    // Verifikasi kompatibilitas AES-256-GCM enc:v1 & backward compatibility legacy decryptMikrotikPassword
+    const enc = encryptMikrotikPassword(custPwd);
+    assert.ok(enc.startsWith('enc:v1:'), 'Format enkripsi harus tetap enc:v1');
+    assert.equal(decryptMikrotikPassword(enc), custPwd);
+    assert.equal(decryptMikrotikPassword('legacy_plain_or_old_format'), 'legacy_plain_or_old_format');
+
+    const createRes = await api('POST', '/customers', {
+      id: 'c-sec-35',
+      name: 'Audit Zero Leak',
+      phone: '083500',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec_clean35',
+      password: custPwd,
+      status: 'active',
+    });
+    const listRes = await api('GET', '/customers');
+    const cfgRes = await api('GET', '/mikrotik/config');
+    const testRes = await api('POST', '/mikrotik/test-connection', {});
+    const syncRes = await api('POST', '/customers/c-sec-35/sync-router');
+
+    const payloads = [createRes.rawText, listRes.rawText, cfgRes.rawText, testRes.rawText, syncRes.rawText];
+    for (const raw of payloads) {
+      assert.ok(!raw.includes(custPwd), 'Password pelanggan bocor ke respons API!');
+      assert.ok(!raw.includes(routerPwd), 'Password router bocor ke respons API!');
+      assert.ok(!/enc:v1:[0-9a-fA-F:]+/.test(raw), 'Ciphertext enc:v1 bocor ke respons API!');
+      assert.ok(!/\n\s*at\s+/.test(raw), 'Stack trace bocor ke respons API!');
+    }
+    assert.equal(cfgRes.json.data.maskedPassword, '••••••••');
+    assert.equal(listRes.json.data[0].maskedPassword, '••••••••');
+
+    // Verifikasi redactSensitiveText mempertahankan [SYNC_META_V1:...] sambil menyensor rahasia
+    const metaTag = '[SYNC_META_V1:eyJ2IjoxLCJuZWVkc1Nlc3Npb25EaXNjb25uZWN0Ijp0cnVlLCJvbGRBY2NvdW50cyI6W119]';
+    const redacted = redactSensitiveText(`Gagal token=ABC_LEAK enc:v1:aa:bb:cc ${metaTag}`);
+    assert.ok(!redacted.includes('ABC_LEAK'));
+    assert.ok(!redacted.includes('enc:v1:aa:bb:cc'));
+    assert.ok(redacted.includes(metaTag), 'Penanda SYNC_META_V1 harus tetap utuh setelah sanitasi');
+  });
+
+  // Skenario 36: Provisioning gagal tidak pernah berstatus synced + pemutusan penuh multi-sesi tetap berjalan aman setelah sanitasi
+  await runScenario(36, 'Audit Keamanan & Regresi: Provisioning gagal tidak menjadi synced, retry + SYNC_META_V1 + multi-sesi disconnect tetap konsisten', async () => {
+    await api('POST', '/customers', {
+      id: 'c-sec-36',
+      name: 'Audit Multi Session',
+      phone: '083600',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec_multi36',
+      password: 'CustomerSecret36',
+      status: 'active',
+    });
+    mockRouter.pppoeActives.push(
+      { '.id': '*M1', name: 'sec_multi36' },
+      { '.id': '*M2', name: 'sec_multi36' }
+    );
+    mockRouter.failRemoveIds.add('*M2');
+
+    const upd = await api('PUT', '/customers/c-sec-36', { packageId: 'pkg-20m', packageName: 'Paket 20 Mbps' });
+    assert.equal(upd.json.data.routerSyncStatus, 'failed', 'Jika sebagian sesi gagal diputus, status dilarang menjadi synced');
+    assert.equal(mockRouter.pppoeActives.length, 1);
+
+    // Pastikan SYNC_META_V1 tetap utuh & terbaca oleh parsePendingSyncActions walaupun terjadi error sebelumnya
+    const parsed = parsePendingSyncActions(upd.json.data.routerSyncStatus, upd.json.data.routerLastSyncMessage);
+    assert.equal(parsed.needsSessionDisconnect, true);
+    assert.equal(parsed.corrupted, false);
+
+    mockRouter.failRemoveIds.delete('*M2');
+    const retry = await api('POST', '/customers/c-sec-36/sync-router');
+    assert.equal(retry.status, 200);
+    assert.equal(retry.json.data.routerSyncStatus, 'synced');
+    assert.equal(mockRouter.pppoeActives.length, 0);
   });
 
   // Restore prototypes & stop servers cleanly

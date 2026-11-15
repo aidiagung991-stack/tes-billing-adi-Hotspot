@@ -1,5 +1,6 @@
 import pg, { Pool, PoolClient, QueryResult } from 'pg';
 import dotenv from 'dotenv';
+import { logSafeServerError, sanitizeDatabaseError } from './errorSanitizer.js';
 
 dotenv.config();
 
@@ -51,7 +52,7 @@ export function getDbPool(): Pool {
 
     pool.on('error', (err) => {
       if (isDatabaseConfigured()) {
-        console.error('[PostgreSQL Pool Error]:', err.message);
+        logSafeServerError('postgres_pool', (err as any)?.code || 'DB_CONNECTION_ERROR');
       }
     });
   }
@@ -78,11 +79,9 @@ export async function query<T extends pg.QueryResultRow = any>(
     const res = await clientPool.query<T>(text, params);
     return res;
   } catch (error: any) {
-    console.error('[PostgreSQL Query Error]:', {
-      message: error.message,
-      code: error.code,
-      query: text.replace(/\s+/g, ' ').slice(0, 100),
-    });
+    const safe = sanitizeDatabaseError(error, 'Terjadi kesalahan saat mengeksekusi operasi database.');
+    const opWord = text.trim().split(/\s+/)[0]?.toUpperCase() || 'QUERY';
+    logSafeServerError('postgres_query', safe.code, { operation: opWord });
     throw error;
   }
 }
@@ -172,15 +171,15 @@ export async function checkDatabaseHealth(): Promise<{
       client.release();
     }
   } catch (err: any) {
-    const errorMsg = err?.message || 'Gagal terhubung ke host database';
+    const safe = sanitizeDatabaseError(err, 'Gagal terhubung ke host database PostgreSQL.');
     const info = {
       isConnected: false,
       host: DB_HOST,
       port: DB_PORT,
       database: DB_NAME,
       user: DB_USER,
-      error: errorMsg,
-      message: `Gagal terhubung ke ${DB_HOST}:${DB_PORT} (${errorMsg})`,
+      error: safe.code,
+      message: `Gagal terhubung ke ${DB_HOST}:${DB_PORT} (${safe.message})`,
     };
     lastConnectionAttempt = {
       isConnected: false,

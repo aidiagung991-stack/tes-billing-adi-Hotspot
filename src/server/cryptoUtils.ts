@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { SafeOperationalError } from './errorSanitizer.js';
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12; // Standar aman untuk AES-256-GCM
@@ -24,8 +25,10 @@ export function isMikrotikEncryptionKeyConfigured(): boolean {
 function getEncryptionKey(): Buffer {
   const envKey = process.env.MIKROTIK_ENCRYPTION_KEY;
   if (!envKey || envKey.trim().length === 0 || envKey === 'your_secure_mikrotik_encryption_passphrase_here') {
-    throw new Error(
-      'Kunci enkripsi MIKROTIK_ENCRYPTION_KEY belum dikonfigurasi di file .env server. Proses enkripsi dan dekripsi ditolak demi keamanan data.'
+    throw new SafeOperationalError(
+      'ENCRYPTION_NOT_CONFIGURED',
+      'Kunci enkripsi MIKROTIK_ENCRYPTION_KEY belum dikonfigurasi di file .env server. Proses enkripsi dan dekripsi ditolak demi keamanan data.',
+      { statusCode: 500 }
     );
   }
   return crypto.createHash('sha256').update(envKey.trim()).digest();
@@ -63,20 +66,30 @@ export function decryptMikrotikPassword(encryptedPayload: string): string {
 
   const parts = encryptedPayload.split(':');
   if (parts.length !== 5) {
-    throw new Error('Format password terenkripsi tidak valid.');
+    throw new SafeOperationalError('DECRYPTION_ERROR', 'Format password terenkripsi tidak valid.', {
+      statusCode: 500,
+    });
   }
 
   const [, , ivHex, authTagHex, cipherHex] = parts;
   const key = getEncryptionKey();
-  const iv = Buffer.from(ivHex, 'hex');
-  const authTag = Buffer.from(authTagHex, 'hex');
+  try {
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
 
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
-  decipher.setAuthTag(authTag);
+    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
+    decipher.setAuthTag(authTag);
 
-  let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
+    let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch {
+    throw new SafeOperationalError(
+      'DECRYPTION_ERROR',
+      'Gagal mendekripsi kredensial terenkripsi. Format atau kunci enkripsi tidak cocok.',
+      { statusCode: 500 }
+    );
+  }
 }
 
 /**

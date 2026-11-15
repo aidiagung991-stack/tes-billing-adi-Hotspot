@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { testConnection, sendWablasMessage, validateWablasServerUrl, DEFAULT_WABLAS_SERVER_URL } from './src/server/wablasProxy';
 import dbRouter from './src/server/dbRoutes';
+import { SafeOperationalError, sanitizeGenericServerError, logSafeServerError } from './src/server/errorSanitizer';
 
 dotenv.config();
 
@@ -87,8 +88,10 @@ function persistConfig() {
     fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
     fs.renameSync(tempFile, CONFIG_FILE);
     fs.chmodSync(CONFIG_FILE, 0o600);
-  } catch (e: any) {
-    throw new Error(`Gagal menyimpan file konfigurasi Wablas: ${e?.message || 'I/O error'}`);
+  } catch {
+    throw new SafeOperationalError('INTERNAL_ERROR', 'Gagal menyimpan file konfigurasi Wablas pada server.', {
+      statusCode: 500,
+    });
   }
 }
 
@@ -190,9 +193,12 @@ app.post('/api/whatsapp/config', (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
+    const safe = sanitizeGenericServerError(error, 'Gagal menyimpan konfigurasi WhatsApp Gateway.');
+    logSafeServerError('whatsapp_config_save', safe.code);
     res.status(500).json({
       success: false,
-      message: 'Gagal menyimpan konfigurasi: ' + (error?.message || 'Internal server error'),
+      errorCode: safe.code,
+      message: safe.message,
     });
   }
 });
@@ -254,14 +260,16 @@ app.post('/api/whatsapp/test-connection', async (req: Request, res: Response) =>
 
     return res.json(result);
   } catch (error: any) {
+    const safe = sanitizeGenericServerError(error, 'Terjadi kesalahan internal saat menguji koneksi Wablas.');
+    logSafeServerError('whatsapp_test_connection', safe.code);
     wablasConnectionStatus = 'disconnected';
     lastTestedAt = new Date().toISOString().replace('T', ' ').slice(0, 16);
-    lastStatusMessage = 'Kesalahan internal saat pengujian: ' + (error?.message || 'Unknown error');
+    lastStatusMessage = safe.message;
 
     return res.json({
       success: false,
       status: 'disconnected',
-      errorCode: 'INTERNAL_TEST_ERROR',
+      errorCode: safe.code,
       statusCode: 500,
       message: lastStatusMessage,
     });
@@ -323,11 +331,13 @@ async function handleSendMessage(req: Request, res: Response) {
       data: result.data,
     });
   } catch (err: any) {
+    const safe = sanitizeGenericServerError(err, 'Terjadi kesalahan internal server saat mengirim pesan WhatsApp.');
+    logSafeServerError('whatsapp_send_message', safe.code);
     return res.json({
       success: false,
-      errorCode: 'INTERNAL_SERVER_ERROR',
+      errorCode: safe.code,
       statusCode: 500,
-      message: 'Kesalahan internal server: ' + (err?.message || 'Unknown error'),
+      message: safe.message,
     });
   }
 }

@@ -23,6 +23,17 @@ import {
   cleanupOldRouterAccount,
   MikrotikConnectionOptions,
 } from './mikrotikService.js';
+import {
+  SafeOperationalError,
+  isSafeOperationalError,
+  isDatabaseErrorObject,
+  sanitizeDatabaseError,
+  sanitizeMikrotikError,
+  sanitizeGenericServerError,
+  redactSensitiveText,
+  toAllowedErrorCode,
+  logSafeServerError,
+} from './errorSanitizer.js';
 
 interface PendingRouterAccount {
   type: 'pppoe' | 'hotspot';
@@ -230,6 +241,14 @@ function mergeOldAccounts(
   return result;
 }
 
+function sanitizeSyncMessagePreservingMeta(message: string | null | undefined): string {
+  if (!message || typeof message !== 'string') return '';
+  const v1Tags = [...message.matchAll(/\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g)].map((m) => m[0]);
+  const cleanBody = redactSensitiveText(message.replace(/\s*\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g, ''));
+  if (v1Tags.length === 0) return cleanBody;
+  return cleanBody ? `${cleanBody} ${v1Tags.join(' ')}` : v1Tags.join(' ');
+}
+
 function appendPendingMarkers(
   baseMessage: string,
   pending: {
@@ -239,7 +258,7 @@ function appendPendingMarkers(
     stages?: PendingSyncStages;
   }
 ): string {
-  const cleanBase = stripPendingMarkersFromMessage(baseMessage);
+  const cleanBase = redactSensitiveText(stripPendingMarkersFromMessage(baseMessage));
   if (!pending.corrupted && !pending.needsSessionDisconnect && pending.oldAccounts.length === 0) {
     return cleanBase;
   }
@@ -328,10 +347,13 @@ router.get('/status', async (_req: Request, res: Response) => {
       ...health,
     });
   } catch (error: any) {
+    const safe = sanitizeDatabaseError(error, 'Koneksi database PostgreSQL mengalami gangguan.');
+    logSafeServerError('GET /api/status', safe.code);
     res.status(500).json({
       success: false,
       isConnected: false,
-      error: error?.message || 'Database connection error',
+      error: safe.code,
+      errorCode: safe.code,
     });
   }
 });
@@ -383,7 +405,9 @@ router.get('/packages', async (_req: Request, res: Response) => {
     `);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil data paket dari PostgreSQL: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil data paket dari database.');
+    logSafeServerError('GET /api/packages', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -496,7 +520,9 @@ router.post('/packages', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Paket berhasil disimpan ke PostgreSQL.', data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan paket ke database: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menyimpan data paket ke database.');
+    logSafeServerError('POST /api/packages', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -598,7 +624,9 @@ router.put('/packages/:id', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Paket berhasil diperbarui di PostgreSQL.', data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui paket: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal memperbarui data paket.');
+    logSafeServerError('PUT /api/packages/:id', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -618,7 +646,9 @@ router.delete('/packages/:id', async (req: Request, res: Response) => {
     await query('DELETE FROM packages WHERE id = $1', [id]);
     res.json({ success: true, message: 'Paket berhasil dihapus dari database.' });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus paket: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menghapus paket.');
+    logSafeServerError('DELETE /api/packages/:id', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -665,12 +695,17 @@ router.get('/customers', async (_req: Request, res: Response) => {
     // Proteksi Keamanan: Tambahkan maskedPassword, JANGAN PERNAH kembalikan password plaintext atau cipher
     const data = result.rows.map((row: any) => ({
       ...row,
+      routerLastSyncMessage: row.routerLastSyncMessage
+        ? sanitizeSyncMessagePreservingMeta(row.routerLastSyncMessage)
+        : row.routerLastSyncMessage,
       maskedPassword: row.isPasswordConfigured ? '••••••••' : '',
     }));
 
     res.json({ success: true, data });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil pelanggan dari PostgreSQL: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil data pelanggan dari database.');
+    logSafeServerError('GET /api/customers', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -960,9 +995,10 @@ router.post('/customers', async (req: Request, res: Response) => {
         ? await verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
         : await verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
       if (!verifyRes.verified) {
-        throw new Error(verifyRes.message);
+        throw new SafeOperationalError('ROUTEROS_TRAP', verifyRes.message);
       }
 
+      const safeProvMessage = redactSensitiveText(provResult.message);
       if (schema.customers) {
         await query(
           `UPDATE customers 
@@ -970,11 +1006,11 @@ router.post('/customers', async (req: Request, res: Response) => {
                router_last_sync_at = CURRENT_TIMESTAMP, 
                router_last_sync_message = $1 
            WHERE id = $2`,
-          [provResult.message, c.id]
+          [safeProvMessage, c.id]
         );
         createdCustomer.routerSyncStatus = 'synced';
         createdCustomer.routerLastSyncAt = new Date().toISOString();
-        createdCustomer.routerLastSyncMessage = provResult.message;
+        createdCustomer.routerLastSyncMessage = safeProvMessage;
       }
 
       res.json({
@@ -984,7 +1020,9 @@ router.post('/customers', async (req: Request, res: Response) => {
       });
     } catch (routerErr: any) {
       // PENTING: Kegagalan komunikasi router TIDAK PERNAH membatalkan/menghapus data pelanggan dari PostgreSQL
-      const safeErrorMsg = `Gagal sinkronisasi router: ${routerErr?.message || 'Koneksi API error'}`;
+      const safeRouter = sanitizeMikrotikError(routerErr, 'Koneksi API router mengalami gangguan.');
+      logSafeServerError('POST /api/customers/sync', safeRouter.code, { resourceId: c.id });
+      const safeErrorMsg = redactSensitiveText(`Gagal sinkronisasi router: ${safeRouter.message}`);
       if (schema.customers) {
         await query(
           `UPDATE customers 
@@ -1001,12 +1039,15 @@ router.post('/customers', async (req: Request, res: Response) => {
 
       res.json({
         success: true,
+        errorCode: safeRouter.code,
         message: `Pelanggan berhasil disimpan ke PostgreSQL, namun sinkronisasi router gagal: ${safeErrorMsg}`,
         data: createdCustomer,
       });
     }
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan pelanggan ke database: ' + error.message });
+    const safe = sanitizeGenericServerError(error, 'Gagal menyimpan pelanggan ke database.');
+    logSafeServerError('POST /api/customers', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -1290,7 +1331,7 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                 : await verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
 
               if (!verifyRes.verified) {
-                throw new Error(verifyRes.message);
+                throw new SafeOperationalError('ROUTEROS_TRAP', verifyRes.message);
               }
 
               // TAHAP 3: Bersihkan akun LAMA (hanya setelah akun baru dibuat & diverifikasi)
@@ -1314,11 +1355,13 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                     : await disconnectPppoeSession(routerOptions, cleanUsername);
                   if (!dcRes.success) {
                     sessionDisconnectFailed = true;
-                    sessionDisconnectError = dcRes.message;
+                    sessionDisconnectError = redactSensitiveText(dcRes.message);
                   }
                 } catch (dcErr: any) {
+                  const safeDc = sanitizeMikrotikError(dcErr, 'Gagal memutuskan sesi aktif pelanggan di router.');
+                  logSafeServerError('PUT /api/customers/disconnect', safeDc.code, { resourceId: id });
                   sessionDisconnectFailed = true;
-                  sessionDisconnectError = dcErr?.message || 'Gagal memutuskan sesi aktif';
+                  sessionDisconnectError = safeDc.message;
                 }
               }
 
@@ -1367,9 +1410,11 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                   if (effectiveDisconnectNeeded) {
                     syncDetails.push('seluruh sesi aktif diputus untuk menerapkan profile/status terbaru');
                   }
-                  const syncMsg = `Akun '${cleanUsername}' (${targetType.toUpperCase()}) berhasil dibuat/diperbarui & diverifikasi di router MikroTik${
-                    syncDetails.length > 0 ? ` (${syncDetails.join(', ')})` : ''
-                  }.`;
+                  const syncMsg = redactSensitiveText(
+                    `Akun '${cleanUsername}' (${targetType.toUpperCase()}) berhasil dibuat/diperbarui & diverifikasi di router MikroTik${
+                      syncDetails.length > 0 ? ` (${syncDetails.join(', ')})` : ''
+                    }.`
+                  );
                   await query(
                     `UPDATE customers SET router_sync_status = 'synced', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
                     [syncMsg, id]
@@ -1380,13 +1425,15 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                 }
               }
             } catch (stageErr: any) {
+              const safeStage = sanitizeMikrotikError(stageErr, 'Proses sinkronisasi ke router mengalami gangguan.');
+              logSafeServerError('PUT /api/customers/sync-stage', safeStage.code, { resourceId: id });
               const effectivePendingDisconnect = pendingDisconnectNeeded || profileChangedOnRouter;
               const stageLabel =
                 stageReached === 'verify'
                   ? `Tahap verifikasi akun baru '${cleanUsername}' gagal (akun lama tetap dipertahankan)`
                   : `Tahap buat/perbarui akun '${cleanUsername}' gagal (akun lama tetap dipertahankan)`;
               const errMsg = appendPendingMarkers(
-                `${stageLabel}: ${stageErr?.message || 'Error'}`,
+                `${stageLabel}: ${safeStage.message}`,
                 {
                   needsSessionDisconnect: effectivePendingDisconnect,
                   oldAccounts: pendingOldAccounts,
@@ -1411,8 +1458,10 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
             }
           }
         } catch (routerErr: any) {
+          const safeRouter = sanitizeMikrotikError(routerErr, 'Gagal melakukan komunikasi dengan router MikroTik.');
+          logSafeServerError('PUT /api/customers/sync', safeRouter.code, { resourceId: id });
           const errMsg = appendPendingMarkers(
-            `Gagal update ke router: ${routerErr?.message || 'Error'}`,
+            `Gagal update ke router: ${safeRouter.message}`,
             {
               needsSessionDisconnect: pendingDisconnectNeeded,
               oldAccounts: pendingOldAccounts,
@@ -1440,7 +1489,9 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Data pelanggan berhasil diperbarui di PostgreSQL.', data: updatedCustomer });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui data pelanggan: ' + error.message });
+    const safe = sanitizeGenericServerError(error, 'Gagal memperbarui data pelanggan.');
+    logSafeServerError('PUT /api/customers/:id', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -1586,8 +1637,10 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
               sessionDisconnectError = dcRes.message;
             }
           } catch (dcErr: any) {
+            const safeDc = sanitizeMikrotikError(dcErr, 'Gagal memutuskan sesi aktif tertunda di router.');
+            logSafeServerError('PATCH /api/customers/:id/status/disconnect', safeDc.code, { resourceId: id });
             remainingSessionDisconnect = true;
-            sessionDisconnectError = dcErr?.message || 'Gagal memutuskan sesi aktif tertunda';
+            sessionDisconnectError = safeDc.message;
           }
         }
 
@@ -1628,9 +1681,11 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
           if (pendingDisconnect) {
             syncNotes.push('seluruh sesi aktif diperiksa & diputus');
           }
-          const syncMsg = `Status akun di router berhasil diubah menjadi ${isDisabled ? 'nonaktif (disabled)' : 'aktif'}${
-            syncNotes.length > 0 ? ` (${syncNotes.join(', ')})` : ''
-          }.`;
+          const syncMsg = redactSensitiveText(
+            `Status akun di router berhasil diubah menjadi ${isDisabled ? 'nonaktif (disabled)' : 'aktif'}${
+              syncNotes.length > 0 ? ` (${syncNotes.join(', ')})` : ''
+            }.`
+          );
           await query(
             `UPDATE customers SET router_sync_status = 'synced', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
             [syncMsg, id]
@@ -1640,8 +1695,10 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
           updatedCustomer.routerLastSyncMessage = syncMsg;
         }
       } catch (routerErr: any) {
+        const safeRouter = sanitizeMikrotikError(routerErr, 'Gagal mengubah status akun di router MikroTik.');
+        logSafeServerError('PATCH /api/customers/:id/status/sync', safeRouter.code, { resourceId: id });
         const errMsg = appendPendingMarkers(
-          `Gagal mengubah status di router: ${routerErr?.message || 'Error'}`,
+          `Gagal mengubah status di router: ${safeRouter.message}`,
           {
             needsSessionDisconnect: pendingDisconnect,
             oldAccounts: pendingOldAccounts,
@@ -1667,7 +1724,9 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: `Status pelanggan berhasil diubah menjadi ${status}.`, data: updatedCustomer });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengubah status pelanggan: ' + error.message });
+    const safe = sanitizeGenericServerError(error, 'Gagal mengubah status pelanggan.');
+    logSafeServerError('PATCH /api/customers/:id/status', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -1856,7 +1915,7 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       ? await verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
       : await verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
     if (!verifyRes.verified) {
-      throw new Error(verifyRes.message);
+      throw new SafeOperationalError('ROUTEROS_TRAP', verifyRes.message);
     }
 
     // TAHAP 3: Ulangi pembersihan akun lama jika kegagalan sebelumnya meninggalkan akun lama / sesi akun lama
@@ -1886,13 +1945,15 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
           : await disconnectPppoeSession(routerOptions, cleanUsername);
         if (!dcRes.success) {
           sessionDisconnectFailed = true;
-          sessionDisconnectError = dcRes.message;
+          sessionDisconnectError = redactSensitiveText(dcRes.message);
         } else if (dcRes.disconnectedCount > 0) {
           sessionDisconnectSummary = `${dcRes.disconnectedCount} sesi aktif diputus`;
         }
       } catch (dcErr: any) {
+        const safeDc = sanitizeMikrotikError(dcErr, 'Gagal memutuskan sesi aktif pelanggan di router.');
+        logSafeServerError('POST /api/customers/:id/sync-router/disconnect', safeDc.code, { resourceId: id });
         sessionDisconnectFailed = true;
-        sessionDisconnectError = dcErr?.message || 'Gagal memutuskan sesi aktif';
+        sessionDisconnectError = safeDc.message;
       }
     }
 
@@ -1932,6 +1993,7 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       }
       return res.status(502).json({
         success: false,
+        errorCode: sessionDisconnectFailed ? 'ROUTEROS_DISCONNECT_INCOMPLETE' : 'ROUTEROS_TRAP',
         message: partialMsg,
         data: {
           id: customer.id,
@@ -1948,7 +2010,7 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       finalDetails.push('pembersihan akun lama selesai');
     }
     finalDetails.push(sessionDisconnectSummary);
-    const finalMsg = `${provResult.message} (${finalDetails.join(', ')})`;
+    const finalMsg = redactSensitiveText(`${provResult.message} (${finalDetails.join(', ')})`);
     const nowIso = new Date().toISOString();
 
     if (schema.customers) {
@@ -1974,8 +2036,13 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       },
     });
   } catch (error: any) {
+    const isDb = isDatabaseErrorObject(error);
+    const safeErr = isDb
+      ? sanitizeDatabaseError(error, 'Gagal memproses data sinkronisasi pelanggan di database.')
+      : sanitizeMikrotikError(error, 'Gagal melakukan sinkronisasi ke router MikroTik.');
+    logSafeServerError('POST /api/customers/:id/sync-router', safeErr.code, { resourceId: req.params.id });
     const safeErrorMsg = appendPendingMarkers(
-      `Gagal sinkronisasi router: ${error?.message || 'Error tidak diketahui'}`,
+      `Gagal sinkronisasi router: ${safeErr.message}`,
       prevPending
     );
     try {
@@ -1990,10 +2057,11 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
         );
       }
     } catch {
-      // ignore
+      // ignore secondary persistence error during failure recovery
     }
     res.status(500).json({
       success: false,
+      errorCode: toAllowedErrorCode(safeErr.code),
       message: safeErrorMsg,
       data: {
         id: req.params.id,
@@ -2025,7 +2093,9 @@ router.delete('/customers/:id', async (req: Request, res: Response) => {
       message: 'Pelanggan berhasil dihapus. Seluruh arsip invoice dan riwayat pembayaran dipertahankan secara utuh.',
     });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus pelanggan: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menghapus pelanggan.');
+    logSafeServerError('DELETE /api/customers/:id', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2062,7 +2132,9 @@ router.get('/invoices', async (_req: Request, res: Response) => {
     `);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil tagihan dari PostgreSQL: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil data tagihan dari database.');
+    logSafeServerError('GET /api/invoices', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2174,7 +2246,9 @@ router.post('/invoices', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Tagihan berhasil disimpan ke PostgreSQL.', data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal membuat tagihan: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal membuat tagihan di database.');
+    logSafeServerError('POST /api/invoices', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2231,7 +2305,9 @@ router.put('/invoices/:id', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Tagihan berhasil diperbarui di PostgreSQL.', data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui tagihan: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal memperbarui tagihan.');
+    logSafeServerError('PUT /api/invoices/:id', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2251,7 +2327,9 @@ router.delete('/invoices/:id', async (req: Request, res: Response) => {
     await query('DELETE FROM invoices WHERE id = $1', [id]);
     res.json({ success: true, message: 'Tagihan berhasil dihapus dari database.' });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus tagihan: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menghapus tagihan.');
+    logSafeServerError('DELETE /api/invoices/:id', safe.code, { resourceId: req.params.id });
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2281,7 +2359,9 @@ router.get('/payments', async (_req: Request, res: Response) => {
     `);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil data pembayaran: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil data pembayaran.');
+    logSafeServerError('GET /api/payments', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2317,7 +2397,7 @@ router.post('/payments', async (req: Request, res: Response) => {
       );
 
       if (invCheck.rows.length === 0) {
-        throw new Error('Tagihan tidak ditemukan dalam sistem.');
+        throw new SafeOperationalError('NOT_FOUND', 'Tagihan tidak ditemukan dalam sistem.', { statusCode: 400 });
       }
 
       const inv = invCheck.rows[0];
@@ -2336,28 +2416,36 @@ router.post('/payments', async (req: Request, res: Response) => {
 
       // Audit A: Periksa apakah total pembayaran di tabel payments sama persis dengan invoices.paid_amount
       if (Math.abs(totalRecordedPayments - invPaidAmount) > 0.01) {
-        throw new Error(
-          `Inkonsistensi data keuangan terdeteksi pada tagihan ${inv.invoice_number}: total pembayaran riwayat (Rp ${totalRecordedPayments.toLocaleString('id-ID')}) tidak sama dengan paid_amount tagihan (Rp ${invPaidAmount.toLocaleString('id-ID')}). Transaksi dibatalkan untuk melindungi integritas buku besar.`
+        throw new SafeOperationalError(
+          'CONFLICT',
+          `Inkonsistensi data keuangan terdeteksi pada tagihan ${inv.invoice_number}: total pembayaran riwayat (Rp ${totalRecordedPayments.toLocaleString('id-ID')}) tidak sama dengan paid_amount tagihan (Rp ${invPaidAmount.toLocaleString('id-ID')}). Transaksi dibatalkan untuk melindungi integritas buku besar.`,
+          { statusCode: 400 }
         );
       }
 
       // Audit B: Periksa apakah invoices.remaining_amount sama dengan (amount - totalRecordedPayments)
       const expectedRemaining = Math.max(0, invTotal - totalRecordedPayments);
       if (Math.abs(invRemainingAmount - expectedRemaining) > 0.01) {
-        throw new Error(
-          `Inkonsistensi data keuangan terdeteksi pada tagihan ${inv.invoice_number}: remaining_amount tagihan (Rp ${invRemainingAmount.toLocaleString('id-ID')}) tidak sama dengan sisa tagihan terverifikasi (Rp ${expectedRemaining.toLocaleString('id-ID')}). Transaksi dibatalkan untuk melindungi integritas buku besar.`
+        throw new SafeOperationalError(
+          'CONFLICT',
+          `Inkonsistensi data keuangan terdeteksi pada tagihan ${inv.invoice_number}: remaining_amount tagihan (Rp ${invRemainingAmount.toLocaleString('id-ID')}) tidak sama dengan sisa tagihan terverifikasi (Rp ${expectedRemaining.toLocaleString('id-ID')}). Transaksi dibatalkan untuk melindungi integritas buku besar.`,
+          { statusCode: 400 }
         );
       }
 
       // Validasi status lunas dan sisa tagihan
       if (inv.status === 'paid' || expectedRemaining <= 0) {
-        throw new Error('Tagihan ini sudah lunas. Tidak dapat menerima pembayaran tambahan.');
+        throw new SafeOperationalError('VALIDATION_ERROR', 'Tagihan ini sudah lunas. Tidak dapat menerima pembayaran tambahan.', {
+          statusCode: 400,
+        });
       }
 
       // Validasi overpayment
       if (totalRecordedPayments + payAmount > invTotal || payAmount > expectedRemaining) {
-        throw new Error(
-          `Nominal pembayaran (Rp ${payAmount.toLocaleString('id-ID')}) melebihi sisa tagihan terverifikasi (Maksimal: Rp ${expectedRemaining.toLocaleString('id-ID')}). Transaksi ditolak.`
+        throw new SafeOperationalError(
+          'VALIDATION_ERROR',
+          `Nominal pembayaran (Rp ${payAmount.toLocaleString('id-ID')}) melebihi sisa tagihan terverifikasi (Maksimal: Rp ${expectedRemaining.toLocaleString('id-ID')}). Transaksi ditolak.`,
+          { statusCode: 400 }
         );
       }
 
@@ -2406,7 +2494,9 @@ router.post('/payments', async (req: Request, res: Response) => {
       );
 
       if (!updInvRes.rows || updInvRes.rows.length === 0) {
-        throw new Error('Database gagal memperbarui baris data tagihan.');
+        throw new SafeOperationalError('DB_QUERY_ERROR', 'Database gagal memperbarui baris data tagihan.', {
+          statusCode: 500,
+        });
       }
 
       // 5. Generate nomor transaksi unik berbasis zona waktu lokal Asia/Jakarta (WIB)
@@ -2473,7 +2563,9 @@ router.post('/payments', async (req: Request, res: Response) => {
       );
 
       if (!insPay.rows || insPay.rows.length === 0) {
-        throw new Error('Database gagal mencatat baris data pembayaran.');
+        throw new SafeOperationalError('DB_QUERY_ERROR', 'Database gagal mencatat baris data pembayaran.', {
+          statusCode: 500,
+        });
       }
 
       // Kembalikan HANYA baris resmi dari PostgreSQL hasil RETURNING
@@ -2490,7 +2582,13 @@ router.post('/payments', async (req: Request, res: Response) => {
       data: paymentResult,
     });
   } catch (error: any) {
-    res.status(400).json({ success: false, message: error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mencatat transaksi pembayaran.');
+    logSafeServerError('POST /api/payments', safe.code);
+    res.status(isSafeOperationalError(error) ? safe.statusCode : safe.statusCode).json({
+      success: false,
+      errorCode: safe.code,
+      message: safe.message,
+    });
   }
 });
 
@@ -2512,7 +2610,9 @@ router.get('/whatsapp/templates', async (_req: Request, res: Response) => {
     `);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil template WhatsApp: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil template WhatsApp.');
+    logSafeServerError('GET /api/whatsapp/templates', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2540,7 +2640,9 @@ router.post('/whatsapp/templates', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: 'Template WhatsApp berhasil disimpan.', data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan template: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menyimpan template WhatsApp.');
+    logSafeServerError('POST /api/whatsapp/templates', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2568,7 +2670,9 @@ router.get('/whatsapp/logs', async (_req: Request, res: Response) => {
     `);
     res.json({ success: true, data: result.rows });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil riwayat pesan WhatsApp: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil riwayat pesan WhatsApp.');
+    logSafeServerError('GET /api/whatsapp/logs', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2613,7 +2717,9 @@ router.post('/whatsapp/logs', async (req: Request, res: Response) => {
 
     res.json({ success: true, data: result.rows[0] });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mencatat log WhatsApp: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mencatat log pesan WhatsApp.');
+    logSafeServerError('POST /api/whatsapp/logs', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2662,7 +2768,9 @@ router.get('/whatsapp/broadcast-history', async (_req: Request, res: Response) =
 
     res.json({ success: true, data: campaignList });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil riwayat broadcast: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil riwayat broadcast.');
+    logSafeServerError('GET /api/whatsapp/broadcast-history', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2720,7 +2828,9 @@ router.post('/whatsapp/broadcast-history', async (req: Request, res: Response) =
 
     res.json({ success: true, message: 'Riwayat broadcast berhasil disimpan ke PostgreSQL.', data: camp });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan riwayat broadcast: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menyimpan riwayat broadcast.');
+    logSafeServerError('POST /api/whatsapp/broadcast-history', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2736,7 +2846,9 @@ router.get('/settings/:key', async (req: Request, res: Response) => {
     }
     res.json({ success: true, data: result.rows[0].value });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil pengaturan: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil pengaturan sistem.');
+    logSafeServerError('GET /api/settings/:key', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2758,7 +2870,9 @@ router.put('/settings/:key', async (req: Request, res: Response) => {
 
     res.json({ success: true, message: `Pengaturan ${key} berhasil disimpan ke PostgreSQL.` });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan pengaturan: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal menyimpan pengaturan sistem.');
+    logSafeServerError('PUT /api/settings/:key', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2833,7 +2947,7 @@ router.get('/mikrotik/config', async (_req: Request, res: Response) => {
         timeoutSeconds: Number(row.timeoutSeconds) || 10,
         notes: row.notes || '',
         lastTestedAt: row.lastTestedAt,
-        lastStatusMessage: row.lastStatusMessage,
+        lastStatusMessage: row.lastStatusMessage ? redactSensitiveText(row.lastStatusMessage) : row.lastStatusMessage,
         isPasswordConfigured: Boolean(row.isPasswordConfigured),
         // Proteksi keamanan: Hanya kirim mask placeholder jika password sudah tersimpan,
         // password asli atau password_encrypted TIDAK PERNAH dikirim ke frontend.
@@ -2842,7 +2956,9 @@ router.get('/mikrotik/config', async (_req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil konfigurasi MikroTik: ' + error.message });
+    const safe = sanitizeDatabaseError(error, 'Gagal mengambil konfigurasi MikroTik dari database.');
+    logSafeServerError('GET /api/mikrotik/config', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -2937,7 +3053,9 @@ router.post('/mikrotik/config', async (req: Request, res: Response) => {
       message: 'Konfigurasi MikroTik berhasil disimpan ke database PostgreSQL.',
     });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan konfigurasi MikroTik: ' + error.message });
+    const safe = sanitizeGenericServerError(error, 'Gagal menyimpan konfigurasi MikroTik.');
+    logSafeServerError('POST /api/mikrotik/config', safe.code);
+    res.status(safe.statusCode).json({ success: false, errorCode: safe.code, message: safe.message });
   }
 });
 
@@ -3031,6 +3149,8 @@ router.post('/mikrotik/test-connection', async (req: Request, res: Response) => 
       });
     } else {
       // Perbarui status router di database menjadi disconnected
+      const safeStatusMsg = redactSensitiveText(result.message);
+      const safeErrorCode = result.errorDetails ? toAllowedErrorCode(result.errorDetails) : undefined;
       await query(
         `
         UPDATE mikrotik_settings
@@ -3041,19 +3161,23 @@ router.post('/mikrotik/test-connection', async (req: Request, res: Response) => 
           updated_at = CURRENT_TIMESTAMP
         WHERE id = 'default'
         `,
-        [result.message]
+        [safeStatusMsg]
       );
 
       res.json({
         success: false,
-        message: result.message,
-        errorDetails: result.errorDetails,
+        message: safeStatusMsg,
+        errorDetails: safeErrorCode,
       });
     }
   } catch (error: any) {
-    res.status(500).json({
+    const safe = sanitizeGenericServerError(error, 'Gagal menguji koneksi router MikroTik.');
+    logSafeServerError('POST /api/mikrotik/test-connection', safe.code);
+    res.status(safe.statusCode).json({
       success: false,
-      message: 'Gagal menguji koneksi MikroTik: ' + error.message,
+      errorCode: safe.code,
+      message: safe.message,
+      errorDetails: safe.code,
     });
   }
 });

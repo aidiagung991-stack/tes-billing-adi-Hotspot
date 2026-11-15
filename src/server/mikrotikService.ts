@@ -1,6 +1,12 @@
 import net from 'net';
 import tls from 'tls';
 import crypto from 'crypto';
+import {
+  SafeOperationalError,
+  isFatalMikrotikError,
+  sanitizeMikrotikError,
+  sanitizeSocketErrorCode,
+} from './errorSanitizer.js';
 
 export interface MikrotikConnectionOptions {
   host: string;
@@ -35,14 +41,20 @@ export interface MikrotikConnectionResult {
  */
 export function validateRouterHost(host: string): string {
   if (!host || typeof host !== 'string') {
-    throw new Error('Alamat IP atau Host router wajib diisi.');
+    throw new SafeOperationalError('VALIDATION_ERROR', 'Alamat IP atau Host router wajib diisi.', {
+      statusCode: 400,
+    });
   }
 
   const cleanHost = host.trim().toLowerCase();
 
   // Larang skema protokol URL seperti http:// atau https://
   if (cleanHost.includes('://')) {
-    throw new Error('Masukkan alamat IP atau Hostname router saja, tanpa awalan protokol seperti http:// atau https://.');
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Masukkan alamat IP atau Hostname router saja, tanpa awalan protokol seperti http:// atau https://.',
+      { statusCode: 400 }
+    );
   }
 
   // Larang cloud metadata endpoints (SSRF protection)
@@ -53,13 +65,21 @@ export function validateRouterHost(host: string): string {
     cleanHost.includes('metadata.internal') ||
     cleanHost === '100.100.100.200'
   ) {
-    throw new Error('Alamat IP tersebut terlarang demi keamanan server (Cloud Metadata Endpoint).');
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Alamat IP tersebut terlarang demi keamanan server (Cloud Metadata Endpoint).',
+      { statusCode: 400 }
+    );
   }
 
   // Pastikan karakter host hanya karakter valid (alfanumerik, titik, tanda hubung, atau kolon IPv6)
   const validHostRegex = /^[a-zA-Z0-9.:_-]+$/;
   if (!validHostRegex.test(cleanHost)) {
-    throw new Error('Format alamat Host / IP router mengandung karakter yang tidak valid.');
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Format alamat Host / IP router mengandung karakter yang tidak valid.',
+      { statusCode: 400 }
+    );
   }
 
   return cleanHost;
@@ -72,7 +92,11 @@ export function validateRouterHost(host: string): string {
 export function validateRouterPort(port: number | string): number {
   const num = typeof port === 'string' ? parseInt(port, 10) : port;
   if (isNaN(num) || num < 1 || num > 65535) {
-    throw new Error('Port API router harus berupa angka antara 1 dan 65535 (default 8728 atau 8729).');
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Port API router harus berupa angka antara 1 dan 65535 (default 8728 atau 8729).',
+      { statusCode: 400 }
+    );
   }
   return num;
 }
@@ -300,11 +324,11 @@ export async function testMikrotikConnection(
           }
         );
       }
-    } catch (err: any) {
+    } catch {
       clearTimeout(timer);
       return finish({
         success: false,
-        message: `Gagal menginisialisasi soket koneksi: ${err?.message || 'Error tidak diketahui'}`,
+        message: 'Gagal menginisialisasi soket koneksi ke router. Periksa alamat host, port, dan jaringan.',
         errorDetails: 'SOCKET_INIT_FAILED',
       });
     }
@@ -322,8 +346,8 @@ export async function testMikrotikConnection(
 
     socket.on('error', (err: any) => {
       clearTimeout(timer);
-      const code = err?.code || '';
-      let userFriendlyMsg = `Gagal terhubung ke router ${cleanHost}:${cleanPort}.`;
+      const code = sanitizeSocketErrorCode(err);
+      let userFriendlyMsg = `Gagal terhubung ke router ${cleanHost}:${cleanPort} karena gangguan jaringan/soket.`;
 
       if (code === 'ECONNREFUSED') {
         userFriendlyMsg = `Koneksi ditolak oleh ${cleanHost}:${cleanPort} (Port tertutup). Pastikan service API MikroTik telah diaktifkan di menu IP > Services (Port 8728 untuk API biasa, Port 8729 untuk API-SSL).`;
@@ -331,16 +355,18 @@ export async function testMikrotikConnection(
         userFriendlyMsg = `Alamat host/jaringan ${cleanHost} tidak dapat dijangkau. Periksa kabel LAN, routing jaringan, atau tunnel VPN.`;
       } else if (code === 'ETIMEDOUT') {
         userFriendlyMsg = `Koneksi ke ${cleanHost}:${cleanPort} timeout. Router tidak merespons.`;
-      } else if (err?.message?.includes('SSL') || err?.message?.includes('TLS')) {
+      } else if (code === 'ENOTFOUND') {
+        userFriendlyMsg = `Hostname router ${cleanHost} tidak dapat ditemukan (DNS error).`;
+      } else if (code === 'ECONNRESET' || code === 'EPIPE') {
+        userFriendlyMsg = `Koneksi ke router ${cleanHost}:${cleanPort} terputus secara mendadak oleh jaringan atau target.`;
+      } else if (code === 'TLS_ERROR') {
         userFriendlyMsg = `Kesalahan negosiasi SSL/TLS pada port ${cleanPort}. Pastikan service api-ssl telah memiliki sertifikat aktif di MikroTik.`;
-      } else {
-        userFriendlyMsg += ` ${err?.message || 'Kesalahan jaringan.'}`;
       }
 
       finish({
         success: false,
         message: userFriendlyMsg,
-        errorDetails: code || err?.message,
+        errorDetails: code,
       });
     });
 
@@ -393,10 +419,9 @@ export async function testMikrotikConnection(
 
       if (replyType === '!fatal') {
         clearTimeout(timer);
-        const msg = sentence.find((w) => w.startsWith('=message='))?.replace('=message=', '') || 'Fatal error dari RouterOS';
         return finish({
           success: false,
-          message: `Koneksi dihentikan oleh router: ${msg}`,
+          message: 'Koneksi dihentikan oleh router MikroTik sebelum proses selesai. Periksa izin API dan layanan RouterOS.',
           errorDetails: 'ROUTEROS_FATAL',
         });
       }
@@ -425,10 +450,9 @@ export async function testMikrotikConnection(
 
         if (replyType === '!trap') {
           clearTimeout(timer);
-          const trapMsg = sentence.find((w) => w.startsWith('=message='))?.replace('=message=', '') || 'Autentikasi gagal';
           return finish({
             success: false,
-            message: `Autentikasi MikroTik gagal: ${trapMsg}. Pastikan username dan password benar serta memiliki izin API.`,
+            message: 'Autentikasi MikroTik gagal. Pastikan username dan password benar serta memiliki izin API.',
             errorDetails: 'AUTH_FAILED',
           });
         }
@@ -459,6 +483,13 @@ export async function testMikrotikConnection(
               gatheredInfo.identity = word.replace('=name=', '');
             }
           }
+        } else if (replyType === '!trap') {
+          clearTimeout(timer);
+          return finish({
+            success: false,
+            message: 'Router menolak perintah pembacaan identitas sistem. Periksa hak akses read API pengguna router.',
+            errorDetails: 'ROUTEROS_TRAP',
+          });
         } else if (replyType === '!done') {
           // Lanjut baca resource router (versi RouterOS, board-name, CPU load)
           currentStep = 'get_resource';
@@ -483,6 +514,13 @@ export async function testMikrotikConnection(
               gatheredInfo.platform = word.replace('=platform=', '');
             }
           }
+        } else if (replyType === '!trap') {
+          clearTimeout(timer);
+          return finish({
+            success: false,
+            message: 'Router menolak perintah pembacaan informasi resource sistem. Periksa hak akses read API pengguna router.',
+            errorDetails: 'ROUTEROS_TRAP',
+          });
         } else if (replyType === '!done') {
           currentStep = 'done';
           clearTimeout(timer);
@@ -604,7 +642,8 @@ export async function withRouterOsClient<T>(
 
     const timer = setTimeout(() => {
       finishError(
-        new Error(
+        new SafeOperationalError(
+          'ETIMEDOUT',
           `Koneksi timeout. Router di ${cleanHost}:${cleanPort} tidak merespons dalam ${timeoutMs / 1000} detik.`
         )
       );
@@ -631,36 +670,46 @@ export async function withRouterOsClient<T>(
           () => onConnected()
         );
       }
-    } catch (err: any) {
+    } catch {
       clearTimeout(timer);
-      return finishError(new Error(`Gagal menginisialisasi soket: ${err?.message || 'Error'}`));
+      return finishError(
+        new SafeOperationalError('SOCKET_INIT_FAILED', 'Gagal menginisialisasi soket koneksi ke router.')
+      );
     }
 
     socket.setTimeout(timeoutMs);
 
     socket.on('timeout', () => {
       clearTimeout(timer);
-      finishError(new Error(`Koneksi timeout ke ${cleanHost}:${cleanPort}. Router tidak merespons.`));
+      finishError(
+        new SafeOperationalError('ETIMEDOUT', `Koneksi timeout ke ${cleanHost}:${cleanPort}. Router tidak merespons.`)
+      );
     });
 
     socket.on('error', (err: any) => {
       clearTimeout(timer);
-      const code = err?.code || '';
-      let userFriendlyMsg = `Gagal terhubung ke router ${cleanHost}:${cleanPort}.`;
+      const code = sanitizeSocketErrorCode(err);
+      let userFriendlyMsg = `Gagal terhubung ke router ${cleanHost}:${cleanPort} karena gangguan jaringan/soket.`;
       if (code === 'ECONNREFUSED') {
         userFriendlyMsg = `Koneksi ditolak oleh ${cleanHost}:${cleanPort} (Port tertutup). Pastikan service API MikroTik aktif di IP > Services.`;
       } else if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH') {
         userFriendlyMsg = `Host ${cleanHost} tidak dapat dijangkau. Periksa routing atau koneksi fisik.`;
-      } else {
-        userFriendlyMsg += ` ${err?.message || 'Kesalahan jaringan.'}`;
+      } else if (code === 'ETIMEDOUT') {
+        userFriendlyMsg = `Koneksi ke ${cleanHost}:${cleanPort} timeout. Router tidak merespons.`;
+      } else if (code === 'ECONNRESET' || code === 'EPIPE') {
+        userFriendlyMsg = `Koneksi ke router ${cleanHost}:${cleanPort} terputus secara mendadak.`;
+      } else if (code === 'TLS_ERROR') {
+        userFriendlyMsg = `Kesalahan negosiasi SSL/TLS pada router ${cleanHost}:${cleanPort}.`;
       }
-      finishError(new Error(userFriendlyMsg));
+      finishError(new SafeOperationalError(code, userFriendlyMsg));
     });
 
     socket.on('close', () => {
       if (!isFinished) {
         clearTimeout(timer);
-        finishError(new Error('Koneksi ke router ditutup sebelum operasi selesai.'));
+        finishError(
+          new SafeOperationalError('CONNECTION_CLOSED_PREMATURELY', 'Koneksi ke router ditutup sebelum operasi selesai.')
+        );
       }
     });
 
@@ -701,8 +750,9 @@ export async function withRouterOsClient<T>(
 
       if (replyType === '!fatal') {
         clearTimeout(timer);
-        const msg = sentence.find((w) => w.startsWith('=message='))?.replace('=message=', '') || 'Fatal error';
-        return finishError(new Error(`Koneksi dihentikan oleh router: ${msg}`));
+        return finishError(
+          new SafeOperationalError('ROUTEROS_FATAL', 'Koneksi dihentikan oleh router MikroTik.', { isFatal: true })
+        );
       }
 
       if (authStep === 'auth_init') {
@@ -725,8 +775,12 @@ export async function withRouterOsClient<T>(
 
         if (replyType === '!trap') {
           clearTimeout(timer);
-          const trapMsg = sentence.find((w) => w.startsWith('=message='))?.replace('=message=', '') || 'Autentikasi gagal';
-          return finishError(new Error(`Autentikasi MikroTik gagal: ${trapMsg}.`));
+          return finishError(
+            new SafeOperationalError(
+              'ROUTEROS_AUTH_FAILED',
+              'Autentikasi MikroTik gagal. Pastikan username dan password router benar serta memiliki izin API.'
+            )
+          );
         }
       }
 
@@ -737,7 +791,9 @@ export async function withRouterOsClient<T>(
         }
         if (replyType === '!trap') {
           clearTimeout(timer);
-          return finishError(new Error('Autentikasi MikroTik gagal (username atau password salah).'));
+          return finishError(
+            new SafeOperationalError('ROUTEROS_AUTH_FAILED', 'Autentikasi MikroTik gagal (username atau password salah).')
+          );
         }
       }
     }
@@ -748,17 +804,19 @@ export async function withRouterOsClient<T>(
       const talk = (sentenceToSend: string[]): Promise<string[][]> => {
         return new Promise((res, rej) => {
           if (isFinished || !socket || socket.destroyed || !socket.writable) {
-            return rej(new Error('Koneksi RouterOS sudah tertutup sebelum perintah dikirim.'));
+            return rej(
+              new SafeOperationalError('ROUTEROS_SOCKET_ERROR', 'Koneksi RouterOS sudah tertutup sebelum perintah dikirim.')
+            );
           }
           activeReplyResolve = res;
           activeReplyReject = rej;
           currentSentenceAccumulator = [];
           try {
             socket.write(encodeSentence(sentenceToSend));
-          } catch (writeErr: any) {
+          } catch {
             activeReplyResolve = null;
             activeReplyReject = null;
-            rej(writeErr instanceof Error ? writeErr : new Error(String(writeErr)));
+            rej(new SafeOperationalError('ROUTEROS_SOCKET_ERROR', 'Gagal mengirim perintah ke koneksi RouterOS.'));
           }
         });
       };
@@ -794,10 +852,11 @@ export async function withRouterOsClient<T>(
 
       if (replyType === '!fatal') {
         clearTimeout(timer);
-        const fatalMsg =
-          sentence.find((w) => w.startsWith('=message='))?.replace('=message=', '') ||
-          'Koneksi API dihentikan oleh RouterOS (Fatal Error)';
-        const fatalErr = new Error(`RouterOS fatal error: ${fatalMsg}`);
+        const fatalErr = new SafeOperationalError(
+          'ROUTEROS_FATAL',
+          'Koneksi API dihentikan oleh RouterOS.',
+          { isFatal: true }
+        );
         if (activeReplyReject) {
           const rejecter = activeReplyReject;
           activeReplyResolve = null;
@@ -825,22 +884,19 @@ export async function withRouterOsClient<T>(
 
 /**
  * Memeriksa kalimat balasan RouterOS API dan memastikan tidak mengandung respons !fatal atau !trap.
- * Jika ditemukan, melempar Error deskriptif dan membatalkan proses provisioning.
+ * Tidak meneruskan isi mentah =message= dari RouterOS; menggunakan pesan operasional terkontrol.
  */
 function assertNoTrapOrFatal(replies: string[][], defaultErrMsg: string): void {
   const fatalSent = replies.find((s) => s[0] === '!fatal');
   if (fatalSent) {
-    const msg =
-      fatalSent.find((w) => w.startsWith('=message='))?.replace('=message=', '') ||
-      'Fatal error dari RouterOS API';
-    throw new Error(`RouterOS fatal error: ${msg}`);
+    throw new SafeOperationalError('ROUTEROS_FATAL', 'Koneksi API dihentikan oleh RouterOS.', {
+      isFatal: true,
+    });
   }
 
   const trapSent = replies.find((s) => s[0] === '!trap');
   if (trapSent) {
-    const msg =
-      trapSent.find((w) => w.startsWith('=message='))?.replace('=message=', '') || defaultErrMsg;
-    throw new Error(msg);
+    throw new SafeOperationalError('ROUTEROS_TRAP', defaultErrMsg);
   }
 }
 
@@ -935,10 +991,13 @@ export async function createOrUpdatePppoeSecret(
   const cleanProfile = data.profile ? data.profile.trim() : '';
 
   if (!cleanUser) {
-    throw new Error('Username PPPoE tidak boleh kosong.');
+    throw new SafeOperationalError('ROUTEROS_VALIDATION_ERROR', 'Username PPPoE tidak boleh kosong.');
   }
   if (!cleanProfile) {
-    throw new Error('Profile PPPoE tidak boleh kosong atau belum dikonfigurasi.');
+    throw new SafeOperationalError(
+      'ROUTEROS_VALIDATION_ERROR',
+      'Profile PPPoE tidak boleh kosong atau belum dikonfigurasi.'
+    );
   }
 
   return await withRouterOsClient(options, async (talk) => {
@@ -948,7 +1007,8 @@ export async function createOrUpdatePppoeSecret(
 
     const matches = findExactMatchingEntries(printReplies, 'name', cleanUser);
     if (matches.length > 1) {
-      throw new Error(
+      throw new SafeOperationalError(
+        'ROUTEROS_DUPLICATE_ACCOUNT',
         `Terdeteksi ${matches.length} akun duplikat PPPoE Secret untuk username '${cleanUser}' di RouterOS. Sinkronisasi dibatalkan demi keamanan — harap bersihkan duplikasi secara manual di WinBox.`
       );
     }
@@ -957,7 +1017,10 @@ export async function createOrUpdatePppoeSecret(
       const existingIdWord = matches[0].find((w) => w.startsWith('=.id='));
       const existingId = existingIdWord?.replace('=.id=', '').trim();
       if (!existingId) {
-        throw new Error(`Secret PPPoE '${cleanUser}' ditemukan tanpa atribut .id RouterOS yang valid.`);
+        throw new SafeOperationalError(
+          'ROUTEROS_TRAP',
+          `Secret PPPoE '${cleanUser}' ditemukan tanpa atribut .id RouterOS yang valid.`
+        );
       }
       const previousProfile =
         matches[0].find((w) => w.startsWith('=profile='))?.replace('=profile=', '').trim() || '';
@@ -988,7 +1051,10 @@ export async function createOrUpdatePppoeSecret(
     } else {
       // TAMBAH BARU (ADD)
       if (!data.password || !data.password.trim()) {
-        throw new Error(`Password PPPoE wajib diisi untuk pembuatan akun baru '${cleanUser}' di router.`);
+        throw new SafeOperationalError(
+          'ROUTEROS_VALIDATION_ERROR',
+          `Password PPPoE wajib diisi untuk pembuatan akun baru '${cleanUser}' di router.`
+        );
       }
       const addCmd = [
         '/ppp/secret/add',
@@ -1072,11 +1138,12 @@ export async function disconnectPppoeSession(
         );
         disconnectedCount++;
       } catch (err: any) {
-        if (err?.message?.startsWith('RouterOS fatal error:')) {
+        if (isFatalMikrotikError(err)) {
           throw err;
         }
         failedIds.push(cleanId);
-        errors.push(err?.message || `Gagal memutus sesi ID ${cleanId}`);
+        const safeErr = sanitizeMikrotikError(err, `Gagal memutus sesi ID ${cleanId}`);
+        errors.push(safeErr.message);
       }
     }
 
@@ -1125,7 +1192,7 @@ export async function togglePppoeSecret(
 ): Promise<{ success: boolean; message: string }> {
   const cleanUser = username.trim();
   if (!cleanUser) {
-    throw new Error('Username PPPoE tidak boleh kosong.');
+    throw new SafeOperationalError('ROUTEROS_VALIDATION_ERROR', 'Username PPPoE tidak boleh kosong.');
   }
 
   return await withRouterOsClient(options, async (talk) => {
@@ -1134,10 +1201,14 @@ export async function togglePppoeSecret(
 
     const matches = findExactMatchingEntries(printReplies, 'name', cleanUser);
     if (matches.length === 0) {
-      throw new Error(`Akun PPPoE '${cleanUser}' tidak ditemukan di router MikroTik.`);
+      throw new SafeOperationalError(
+        'ROUTEROS_NOT_FOUND',
+        `Akun PPPoE '${cleanUser}' tidak ditemukan di router MikroTik.`
+      );
     }
     if (matches.length > 1) {
-      throw new Error(
+      throw new SafeOperationalError(
+        'ROUTEROS_DUPLICATE_ACCOUNT',
         `Terdeteksi ${matches.length} akun duplikat PPPoE Secret untuk '${cleanUser}' di RouterOS. Perubahan status dibatalkan demi keamanan.`
       );
     }
@@ -1145,7 +1216,10 @@ export async function togglePppoeSecret(
     const idWord = matches[0].find((w) => w.startsWith('=.id='));
     const secretId = idWord?.replace('=.id=', '').trim();
     if (!secretId) {
-      throw new Error(`Secret PPPoE '${cleanUser}' tidak memiliki .id yang valid di RouterOS.`);
+      throw new SafeOperationalError(
+        'ROUTEROS_TRAP',
+        `Secret PPPoE '${cleanUser}' tidak memiliki .id yang valid di RouterOS.`
+      );
     }
 
     const cleanId = secretId.startsWith('*') ? secretId : `*${secretId}`;
@@ -1168,15 +1242,17 @@ export async function togglePppoeSecret(
             `Gagal memutuskan sesi aktif PPPoE '${cleanUser}' (ID ${cleanActiveId}) saat penonaktifan.`
           );
         } catch (err: any) {
-          if (err?.message?.startsWith('RouterOS fatal error:')) {
+          if (isFatalMikrotikError(err)) {
             throw err;
           }
-          disconnectErrors.push(err?.message || `Gagal memutus sesi ${cleanActiveId}`);
+          const safeErr = sanitizeMikrotikError(err, `Gagal memutus sesi ${cleanActiveId}`);
+          disconnectErrors.push(safeErr.message);
         }
       }
 
       if (disconnectErrors.length > 0) {
-        throw new Error(
+        throw new SafeOperationalError(
+          'ROUTEROS_DISCONNECT_INCOMPLETE',
           `Status secret PPPoE '${cleanUser}' diubah ke disabled, namun ${disconnectErrors.length} sesi aktif gagal diputus: ${disconnectErrors[0]}`
         );
       }
@@ -1186,7 +1262,8 @@ export async function togglePppoeSecret(
         assertNoTrapOrFatal(verifyActiveReplies, `Gagal memeriksa ulang sesi aktif PPPoE '${cleanUser}' saat penonaktifan.`);
         const remainingIds = extractMatchingIds(verifyActiveReplies, 'name', cleanUser);
         if (remainingIds.length > 0) {
-          throw new Error(
+          throw new SafeOperationalError(
+            'ROUTEROS_DISCONNECT_INCOMPLETE',
             `Status secret PPPoE '${cleanUser}' diubah ke disabled, namun ${remainingIds.length} sesi aktif masih tersisa di router.`
           );
         }
@@ -1217,10 +1294,13 @@ export async function createOrUpdateHotspotUser(
   const cleanProfile = data.profile ? data.profile.trim() : '';
 
   if (!cleanUser) {
-    throw new Error('Username Hotspot tidak boleh kosong.');
+    throw new SafeOperationalError('ROUTEROS_VALIDATION_ERROR', 'Username Hotspot tidak boleh kosong.');
   }
   if (!cleanProfile) {
-    throw new Error('Profile Hotspot tidak boleh kosong atau belum dikonfigurasi.');
+    throw new SafeOperationalError(
+      'ROUTEROS_VALIDATION_ERROR',
+      'Profile Hotspot tidak boleh kosong atau belum dikonfigurasi.'
+    );
   }
 
   return await withRouterOsClient(options, async (talk) => {
@@ -1229,7 +1309,8 @@ export async function createOrUpdateHotspotUser(
 
     const matches = findExactMatchingEntries(printReplies, 'name', cleanUser);
     if (matches.length > 1) {
-      throw new Error(
+      throw new SafeOperationalError(
+        'ROUTEROS_DUPLICATE_ACCOUNT',
         `Terdeteksi ${matches.length} akun duplikat Hotspot User untuk username '${cleanUser}' di RouterOS. Sinkronisasi dibatalkan demi keamanan — harap bersihkan duplikasi secara manual di WinBox.`
       );
     }
@@ -1238,7 +1319,10 @@ export async function createOrUpdateHotspotUser(
       const idWord = matches[0].find((w) => w.startsWith('=.id='));
       const existingId = idWord?.replace('=.id=', '').trim();
       if (!existingId) {
-        throw new Error(`User Hotspot '${cleanUser}' ditemukan tanpa atribut .id RouterOS yang valid.`);
+        throw new SafeOperationalError(
+          'ROUTEROS_TRAP',
+          `User Hotspot '${cleanUser}' ditemukan tanpa atribut .id RouterOS yang valid.`
+        );
       }
       const previousProfile =
         matches[0].find((w) => w.startsWith('=profile='))?.replace('=profile=', '').trim() || '';
@@ -1264,7 +1348,10 @@ export async function createOrUpdateHotspotUser(
       };
     } else {
       if (!data.password || !data.password.trim()) {
-        throw new Error(`Password Hotspot wajib diisi untuk user baru '${cleanUser}'.`);
+        throw new SafeOperationalError(
+          'ROUTEROS_VALIDATION_ERROR',
+          `Password Hotspot wajib diisi untuk user baru '${cleanUser}'.`
+        );
       }
       const addCmd = [
         '/ip/hotspot/user/add',
@@ -1343,11 +1430,12 @@ export async function disconnectHotspotSession(
         );
         disconnectedCount++;
       } catch (err: any) {
-        if (err?.message?.startsWith('RouterOS fatal error:')) {
+        if (isFatalMikrotikError(err)) {
           throw err;
         }
         failedIds.push(cleanId);
-        errors.push(err?.message || `Gagal memutus sesi ID ${cleanId}`);
+        const safeErr = sanitizeMikrotikError(err, `Gagal memutus sesi ID ${cleanId}`);
+        errors.push(safeErr.message);
       }
     }
 
@@ -1396,7 +1484,7 @@ export async function toggleHotspotUser(
 ): Promise<{ success: boolean; message: string }> {
   const cleanUser = username.trim();
   if (!cleanUser) {
-    throw new Error('Username Hotspot tidak boleh kosong.');
+    throw new SafeOperationalError('ROUTEROS_VALIDATION_ERROR', 'Username Hotspot tidak boleh kosong.');
   }
 
   return await withRouterOsClient(options, async (talk) => {
@@ -1405,10 +1493,14 @@ export async function toggleHotspotUser(
 
     const matches = findExactMatchingEntries(printReplies, 'name', cleanUser);
     if (matches.length === 0) {
-      throw new Error(`User Hotspot '${cleanUser}' tidak ditemukan di router MikroTik.`);
+      throw new SafeOperationalError(
+        'ROUTEROS_NOT_FOUND',
+        `User Hotspot '${cleanUser}' tidak ditemukan di router MikroTik.`
+      );
     }
     if (matches.length > 1) {
-      throw new Error(
+      throw new SafeOperationalError(
+        'ROUTEROS_DUPLICATE_ACCOUNT',
         `Terdeteksi ${matches.length} akun duplikat Hotspot User untuk '${cleanUser}' di RouterOS. Perubahan status dibatalkan demi keamanan.`
       );
     }
@@ -1416,7 +1508,10 @@ export async function toggleHotspotUser(
     const idWord = matches[0].find((w) => w.startsWith('=.id='));
     const userId = idWord?.replace('=.id=', '').trim();
     if (!userId) {
-      throw new Error(`User Hotspot '${cleanUser}' tidak memiliki .id yang valid di RouterOS.`);
+      throw new SafeOperationalError(
+        'ROUTEROS_TRAP',
+        `User Hotspot '${cleanUser}' tidak memiliki .id yang valid di RouterOS.`
+      );
     }
 
     const cleanId = userId.startsWith('*') ? userId : `*${userId}`;
@@ -1438,15 +1533,17 @@ export async function toggleHotspotUser(
             `Gagal memutuskan sesi aktif Hotspot '${cleanUser}' (ID ${cleanActiveId}) saat penonaktifan.`
           );
         } catch (err: any) {
-          if (err?.message?.startsWith('RouterOS fatal error:')) {
+          if (isFatalMikrotikError(err)) {
             throw err;
           }
-          disconnectErrors.push(err?.message || `Gagal memutus sesi ${cleanActiveId}`);
+          const safeErr = sanitizeMikrotikError(err, `Gagal memutus sesi ${cleanActiveId}`);
+          disconnectErrors.push(safeErr.message);
         }
       }
 
       if (disconnectErrors.length > 0) {
-        throw new Error(
+        throw new SafeOperationalError(
+          'ROUTEROS_DISCONNECT_INCOMPLETE',
           `Status user Hotspot '${cleanUser}' diubah ke disabled, namun ${disconnectErrors.length} sesi aktif gagal diputus: ${disconnectErrors[0]}`
         );
       }
@@ -1456,7 +1553,8 @@ export async function toggleHotspotUser(
         assertNoTrapOrFatal(verifyActiveReplies, `Gagal memeriksa ulang sesi aktif Hotspot '${cleanUser}' saat penonaktifan.`);
         const remainingIds = extractMatchingIds(verifyActiveReplies, 'user', cleanUser);
         if (remainingIds.length > 0) {
-          throw new Error(
+          throw new SafeOperationalError(
+            'ROUTEROS_DISCONNECT_INCOMPLETE',
             `Status user Hotspot '${cleanUser}' diubah ke disabled, namun ${remainingIds.length} sesi aktif masih tersisa di router.`
           );
         }
@@ -1626,11 +1724,12 @@ export async function removePppoeSecret(
         assertNoTrapOrFatal(removeReplies, `Gagal menghapus secret PPPoE lama '${cleanUser}' (ID ${cleanId}).`);
         removedCount++;
       } catch (err: any) {
-        if (err?.message?.startsWith('RouterOS fatal error:')) {
+        if (isFatalMikrotikError(err)) {
           throw err;
         }
         failedIds.push(cleanId);
-        errors.push(err?.message || `Gagal menghapus secret ${cleanId}`);
+        const safeErr = sanitizeMikrotikError(err, `Gagal menghapus secret ${cleanId}`);
+        errors.push(safeErr.message);
       }
     }
 
@@ -1688,11 +1787,12 @@ export async function removeHotspotUser(
         assertNoTrapOrFatal(removeReplies, `Gagal menghapus user Hotspot lama '${cleanUser}' (ID ${cleanId}).`);
         removedCount++;
       } catch (err: any) {
-        if (err?.message?.startsWith('RouterOS fatal error:')) {
+        if (isFatalMikrotikError(err)) {
           throw err;
         }
         failedIds.push(cleanId);
-        errors.push(err?.message || `Gagal menghapus user ${cleanId}`);
+        const safeErr = sanitizeMikrotikError(err, `Gagal menghapus user ${cleanId}`);
+        errors.push(safeErr.message);
       }
     }
 
@@ -1754,12 +1854,15 @@ export async function cleanupOldRouterAccount(
       errors.push(`hapus akun lama gagal: ${rmRes.message}`);
     }
   } catch (err: any) {
-    const errMsg = err?.message || `Gagal menghapus akun ${oldType.toUpperCase()} lama '${cleanOldUser}'`;
+    const safeErr = sanitizeMikrotikError(
+      err,
+      `Gagal menghapus akun ${oldType.toUpperCase()} lama '${cleanOldUser}'`
+    );
     return {
       success: false,
       accountRemoved: false,
       sessionsDisconnected: false,
-      message: `hapus akun lama gagal (koneksi/fatal): ${errMsg}`,
+      message: `hapus akun lama gagal (koneksi/fatal): ${safeErr.message}`,
     };
   }
 
@@ -1777,9 +1880,12 @@ export async function cleanupOldRouterAccount(
       );
     }
   } catch (err: any) {
-    const errMsg = err?.message || `Gagal memutus sesi aktif ${oldType.toUpperCase()} lama '${cleanOldUser}'`;
+    const safeErr = sanitizeMikrotikError(
+      err,
+      `Gagal memutus sesi aktif ${oldType.toUpperCase()} lama '${cleanOldUser}'`
+    );
     errors.push(
-      `${accountRemoved ? 'akun lama sudah dihapus, namun ' : ''}pemutusan sesi aktif akun lama gagal: ${errMsg}`
+      `${accountRemoved ? 'akun lama sudah dihapus, namun ' : ''}pemutusan sesi aktif akun lama gagal: ${safeErr.message}`
     );
   }
 

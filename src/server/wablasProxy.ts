@@ -373,7 +373,7 @@ export async function testConnection(
     return {
       success: false,
       status: 'disconnected',
-      message: `Gagal menghubungi endpoint ${serverUrl}: ${errMessage || 'Jaringan tidak dapat dijangkau'}`,
+      message: `Gagal menghubungi endpoint ${serverUrl}: Jaringan tidak dapat dijangkau atau terjadi kesalahan koneksi.`,
     };
   }
 }
@@ -658,11 +658,19 @@ export async function sendWablasMessage(
       };
     }
 
+    const netCode = error?.cause?.code || error?.code;
+    const netMsg =
+      netCode === 'ENOTFOUND'
+        ? 'Domain server Wablas tidak dapat dijangkau (DNS host tidak ditemukan).'
+        : netCode === 'ECONNREFUSED'
+        ? 'Koneksi ditolak oleh server Wablas.'
+        : 'Jaringan ke server Wablas tidak dapat dijangkau.';
+
     return {
       success: false,
       errorCode: 'NETWORK_ERROR',
       statusCode: 503,
-      message: `Gagal menghubungi server Wablas: ${error?.message || 'Jaringan tidak dapat dijangkau'}`,
+      message: `Gagal menghubungi server Wablas: ${netMsg}`,
     };
   }
 }
