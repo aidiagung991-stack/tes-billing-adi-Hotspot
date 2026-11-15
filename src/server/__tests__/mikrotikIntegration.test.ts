@@ -863,7 +863,7 @@ async function main() {
   } = await import('../mikrotikService.js');
   const { ALLOWED_ERROR_CODES, sanitizeSocketErrorCode, redactSensitiveText } = await import('../errorSanitizer.js');
   const dbRoutesModule = await import('../dbRoutes.js');
-  const { parsePendingSyncActions } = dbRoutesModule;
+  const { parsePendingSyncActions, sanitizeMikrotikOperationMessage, createDbRouter } = dbRoutesModule;
 
   const routerPasswordEnc = encryptMikrotikPassword('router_secret_123');
   dbStore.reset(routerPort, routerPasswordEnc);
@@ -2121,6 +2121,295 @@ async function main() {
     assert.equal(retry.status, 200);
     assert.equal(retry.json.data.routerSyncStatus, 'synced');
     assert.equal(mockRouter.pppoeActives.length, 0);
+  });
+
+  // Skenario 37: Helper sanitizeMikrotikOperationMessage memelihara pesan bisnis aman, memblokir kebocoran operasional/rahasia, & membatasi panjang pesan
+  await runScenario(37, 'Audit Sanitasi Pesan Operasi: sanitizeMikrotikOperationMessage pertahankan pesan bisnis aman, blokir !trap/!fatal/socket/SQL/stack/secret, & batasi panjang', async () => {
+    const safeProfileMissing =
+      "Profile MikroTik 'paket-10mbps' tidak ditemukan pada router di menu PPP > Profiles. Harap buat profile tersebut terlebih dahulu di WinBox.";
+    const safeCreated = "Secret PPPoE 'pelanggan01' berhasil dibuat di router MikroTik.";
+    const safeNoSession = "Tidak ada sesi aktif PPPoE yang sedang berjalan untuk 'pelanggan01'.";
+
+    assert.equal(
+      sanitizeMikrotikOperationMessage(safeProfileMissing, 'Fallback aman'),
+      safeProfileMissing,
+      'Pesan bisnis aman profile tidak ditemukan harus dipertahankan'
+    );
+    assert.equal(
+      sanitizeMikrotikOperationMessage(safeCreated, 'Fallback aman'),
+      safeCreated,
+      'Pesan bisnis aman akun dibuat harus dipertahankan'
+    );
+    assert.equal(
+      sanitizeMikrotikOperationMessage(safeNoSession, 'Fallback aman'),
+      safeNoSession,
+      'Pesan bisnis aman tidak ada sesi aktif harus dipertahankan'
+    );
+
+    const leakVectors = [
+      '!trap =message=secret profile invalid password=LEAK_TRAP_PWD_111',
+      '!fatal =ret=0 token=LEAK_FATAL_TOKEN_222',
+      'connect ECONNREFUSED 10.99.88.77:8728 socket hang up',
+      'SELECT password_encrypted FROM mikrotik_settings WHERE id = 1',
+      'Gagal internal enc:v1:0123456789abcdef:fedcba9876543210:001122',
+      'TypeError: cannot read properties\n    at provisionUser (/app/src/server/mikrotikService.ts:123:45)',
+      `Kebocoran env secret ${process.env.MIKROTIK_ENCRYPTION_KEY} saat operasi`,
+    ];
+
+    for (const vec of leakVectors) {
+      const sanitized = sanitizeMikrotikOperationMessage(vec, 'Operasi router gagal diproses dengan aman.');
+      assert.equal(
+        sanitized,
+        'Operasi router gagal diproses dengan aman.',
+        `Pesan tidak aman seharusnya diganti fallback: ${vec}`
+      );
+    }
+
+    const hugeLog = `Profil berhasil terverifikasi ${'A'.repeat(1500)}`;
+    const capped = sanitizeMikrotikOperationMessage(hugeLog, 'Fallback aman');
+    assert.ok(capped.length <= 260, `Pesan operasi harus dibatasi panjangnya (aktual: ${capped.length})`);
+    assert.ok(capped.endsWith('...'), 'Pesan operasi panjang harus dipotong rapi dengan elipsis');
+  });
+
+  // Skenario 38: Pengujian end-to-end sanitasi pesan operasi MikroTik di POST /customers, PUT /customers/:id, PATCH /customers/:id/status, & POST /customers/:id/sync-router + keutuhan SYNC_META_V1
+  await runScenario(38, 'Audit Sanitasi Pesan Operasi End-to-End: POST/PUT/PATCH/sync-router tidak pernah membocorkan !trap/!fatal/socket/SQL/stack/secret & pertahankan SYNC_META_V1', async () => {
+    const LEAK_PAYLOAD =
+      "!trap !fatal =message=fail connect ECONNREFUSED 10.10.9.9:8728 password=RAW_OP_PASS token=RAW_OP_TOKEN enc:v1:aa11bb:cc22dd:ee33ff SELECT * FROM mikrotik_settings WHERE host='10.1.1.1'\n    at runSocket (/app/src/server/mikrotikService.ts:44:12) " +
+      'LOG_PADDING_'.repeat(120);
+    const FORBIDDEN_MARKERS = [
+      '!trap',
+      '!fatal',
+      '=message=',
+      'ECONNREFUSED',
+      'RAW_OP_PASS',
+      'RAW_OP_TOKEN',
+      'enc:v1:aa11bb',
+      'SELECT * FROM',
+      'mikrotikService.ts',
+      'LOG_PADDING_',
+    ];
+
+    const assertNoLeakAndCapped = (text: string | null | undefined, context: string) => {
+      const val = text || '';
+      for (const marker of FORBIDDEN_MARKERS) {
+        assert.ok(!val.includes(marker), `${context} membocorkan "${marker}"`);
+      }
+      const withoutMeta = val.replace(/\s*\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g, '').trim();
+      assert.ok(
+        withoutMeta.length <= 420,
+        `${context} melebihi batas panjang pesan aman (${withoutMeta.length} > 420): ${withoutMeta}`
+      );
+    };
+
+    type OpMode = 'profile_fail' | 'verify_fail' | 'cleanup_dc_fail' | 'oversized_ok';
+    let currentMode: OpMode = 'profile_fail';
+    const fakeProfileRes = async () =>
+      currentMode === 'profile_fail'
+        ? { exists: false, message: LEAK_PAYLOAD }
+        : { exists: true, message: `Profile valid ${'X'.repeat(1200)}` };
+    const fakeProvisionRes = async (_opts: any, _params: any) => ({
+      success: true,
+      action: 'set' as const,
+      profileChanged: true,
+      message: currentMode === 'oversized_ok' ? `Sinkronisasi akun berhasil dengan catatan panjang ${'Z'.repeat(1200)}` : LEAK_PAYLOAD,
+    });
+    const fakeVerifyRes = async () =>
+      currentMode === 'verify_fail'
+        ? { verified: false, count: 0, message: LEAK_PAYLOAD }
+        : { verified: true, count: 1, message: 'Terverifikasi tunggal' };
+    const fakeCleanupRes = async () =>
+      currentMode === 'cleanup_dc_fail'
+        ? { success: false, message: LEAK_PAYLOAD }
+        : { success: true, message: 'Akun lama bersih' };
+    const fakeDisconnectRes = async () =>
+      currentMode === 'cleanup_dc_fail'
+        ? { success: false, message: LEAK_PAYLOAD, disconnected: false, disconnectedCount: 0, failedCount: 1 }
+        : { success: true, message: '1 sesi diputus', disconnected: true, disconnectedCount: 1, failedCount: 0 };
+
+    const injectedRouter = createDbRouter({
+      checkProfileExists: fakeProfileRes as any,
+      createOrUpdatePppoeSecret: fakeProvisionRes as any,
+      createOrUpdateHotspotUser: fakeProvisionRes as any,
+      verifyPppoeSecretExists: fakeVerifyRes as any,
+      verifyHotspotUserExists: fakeVerifyRes as any,
+      cleanupOldRouterAccount: fakeCleanupRes as any,
+      disconnectPppoeSession: fakeDisconnectRes as any,
+      disconnectHotspotSession: fakeDisconnectRes as any,
+      togglePppoeSecret: async () => ({ success: true, message: LEAK_PAYLOAD }),
+      toggleHotspotUser: async () => ({ success: true, message: LEAK_PAYLOAD }),
+    });
+
+    const injectedApp = express();
+    injectedApp.use(express.json());
+    injectedApp.use('/api', injectedRouter);
+    const injectedServer = http.createServer(injectedApp);
+    await new Promise<void>((resolve) => injectedServer.listen(0, '127.0.0.1', () => resolve()));
+    const injectedBase = `http://127.0.0.1:${(injectedServer.address() as net.AddressInfo).port}/api`;
+
+    const apiInjected = async (method: string, path: string, body?: any) => {
+      const res = await fetch(`${injectedBase}${path}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const rawText = await res.text();
+      return { status: res.status, json: rawText ? JSON.parse(rawText) : null, rawText };
+    };
+
+    try {
+      // 38a: POST /customers dengan profileCheck gagal berisi payload berbahaya
+      currentMode = 'profile_fail';
+      const postProfFail = await apiInjected('POST', '/customers', {
+        id: 'c-sec-38-post-prof',
+        name: 'Audit Post Profile Fail',
+        phone: '083801',
+        packageId: 'pkg-10m',
+        packageName: 'Paket 10 Mbps',
+        type: 'pppoe',
+        username: 'sec38_post_prof',
+        password: 'CustomerSecret38A',
+        status: 'active',
+      });
+      assert.equal(postProfFail.status, 200);
+      assert.equal(postProfFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(postProfFail.json.message, 'POST /customers profile_fail api.message');
+      assertNoLeakAndCapped(postProfFail.json.data.routerLastSyncMessage, 'POST /customers profile_fail data.routerLastSyncMessage');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-post-prof')?.router_last_sync_message, 'POST /customers profile_fail DB');
+
+      // 38b: POST /customers dengan verify gagal berisi payload berbahaya
+      currentMode = 'verify_fail';
+      const postVerFail = await apiInjected('POST', '/customers', {
+        id: 'c-sec-38-post-ver',
+        name: 'Audit Post Verify Fail',
+        phone: '083802',
+        packageId: 'pkg-10m',
+        packageName: 'Paket 10 Mbps',
+        type: 'pppoe',
+        username: 'sec38_post_ver',
+        password: 'CustomerSecret38B',
+        status: 'active',
+      });
+      assert.equal(postVerFail.status, 200);
+      assert.equal(postVerFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(postVerFail.json.message, 'POST /customers verify_fail api.message');
+      assertNoLeakAndCapped(postVerFail.json.data.routerLastSyncMessage, 'POST /customers verify_fail data.routerLastSyncMessage');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-post-ver')?.router_last_sync_message, 'POST /customers verify_fail DB');
+
+      // 38c: POST /customers berhasil dengan provResult.message sangat panjang -> synced & terpotong rapi
+      currentMode = 'oversized_ok';
+      const postOk = await apiInjected('POST', '/customers', {
+        id: 'c-sec-38-main',
+        name: 'Audit Main 38',
+        phone: '083803',
+        packageId: 'pkg-10m',
+        packageName: 'Paket 10 Mbps',
+        type: 'pppoe',
+        username: 'sec38_old_user',
+        password: 'CustomerSecret38C',
+        status: 'active',
+      });
+      assert.equal(postOk.status, 200);
+      assert.equal(postOk.json.data.routerSyncStatus, 'synced');
+      assertNoLeakAndCapped(postOk.json.data.routerLastSyncMessage, 'POST /customers oversized_ok');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'POST /customers oversized_ok DB');
+
+      // 38d-1: PUT /customers/:id saat profileCheck gagal berisi payload berbahaya (pending marker tetap aman & utuh)
+      currentMode = 'profile_fail';
+      const putProfFail = await apiInjected('PUT', '/customers/c-sec-38-main', {
+        username: 'sec38_new_user',
+        packageId: 'pkg-20m',
+        packageName: 'Paket 20 Mbps',
+      });
+      assert.equal(putProfFail.status, 200);
+      assert.equal(putProfFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(putProfFail.json.message, 'PUT /customers profile_fail api.message');
+      assertNoLeakAndCapped(putProfFail.json.data.routerLastSyncMessage, 'PUT /customers profile_fail data.routerLastSyncMessage');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'PUT /customers profile_fail DB');
+      const parsedPutProf = parsePendingSyncActions('failed', putProfFail.json.data.routerLastSyncMessage);
+      assert.equal(parsedPutProf.corrupted, false);
+      assert.deepEqual(parsedPutProf.oldAccounts, [{ type: 'pppoe', username: 'sec38_old_user' }]);
+
+      // 38d-2: PUT /customers/:id saat verify gagal berisi payload berbahaya
+      currentMode = 'verify_fail';
+      const putVerFail = await apiInjected('PUT', '/customers/c-sec-38-main', {
+        packageId: 'pkg-20m',
+        packageName: 'Paket 20 Mbps',
+      });
+      assert.equal(putVerFail.status, 200);
+      assert.equal(putVerFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(putVerFail.json.message, 'PUT /customers verify_fail api.message');
+      assertNoLeakAndCapped(putVerFail.json.data.routerLastSyncMessage, 'PUT /customers verify_fail data.routerLastSyncMessage');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'PUT /customers verify_fail DB');
+      const parsedPutVer = parsePendingSyncActions('failed', putVerFail.json.data.routerLastSyncMessage);
+      assert.equal(parsedPutVer.corrupted, false);
+      assert.deepEqual(parsedPutVer.oldAccounts, [{ type: 'pppoe', username: 'sec38_old_user' }]);
+
+      // 38d-3: PUT /customers/:id saat cleanupOldRouterAccount & disconnectPppoeSession gagal dengan payload berbahaya
+      currentMode = 'cleanup_dc_fail';
+      const putFail = await apiInjected('PUT', '/customers/c-sec-38-main', {
+        packageId: 'pkg-20m',
+        packageName: 'Paket 20 Mbps',
+      });
+      assert.equal(putFail.status, 200);
+      assert.equal(putFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(putFail.json.message, 'PUT /customers cleanup_dc_fail api.message');
+      assertNoLeakAndCapped(putFail.json.data.routerLastSyncMessage, 'PUT /customers cleanup_dc_fail data.routerLastSyncMessage');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'PUT /customers cleanup_dc_fail DB');
+      const parsedAfterPut = parsePendingSyncActions('failed', putFail.json.data.routerLastSyncMessage);
+      assert.equal(parsedAfterPut.corrupted, false, 'SYNC_META_V1 setelah PUT sanitasi harus utuh & valid');
+      assert.equal(parsedAfterPut.needsSessionDisconnect, true);
+      assert.deepEqual(parsedAfterPut.oldAccounts, [{ type: 'pppoe', username: 'sec38_old_user' }]);
+
+      // 38e: PATCH /customers/:id/status saat cleanupOldRouterAccount & disconnectPppoeSession gagal dengan payload berbahaya
+      const patchFail = await apiInjected('PATCH', '/customers/c-sec-38-main/status', { status: 'isolated' });
+      assert.equal(patchFail.status, 200);
+      assert.equal(patchFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(patchFail.json.message, 'PATCH /status cleanup_dc_fail api.message');
+      assertNoLeakAndCapped(patchFail.json.data.routerLastSyncMessage, 'PATCH /status cleanup_dc_fail data.routerLastSyncMessage');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'PATCH /status cleanup_dc_fail DB');
+      const parsedAfterPatch = parsePendingSyncActions('failed', patchFail.json.data.routerLastSyncMessage);
+      assert.equal(parsedAfterPatch.corrupted, false, 'SYNC_META_V1 setelah PATCH status sanitasi harus utuh & valid');
+      assert.equal(parsedAfterPatch.needsSessionDisconnect, true);
+      assert.deepEqual(parsedAfterPatch.oldAccounts, [{ type: 'pppoe', username: 'sec38_old_user' }]);
+
+      // 38f: POST /customers/:id/sync-router pada profile_fail, verify_fail, cleanup_dc_fail, dan oversized_ok
+      currentMode = 'profile_fail';
+      const syncProfFail = await apiInjected('POST', '/customers/c-sec-38-main/sync-router');
+      assert.equal(syncProfFail.status, 400);
+      assert.equal(syncProfFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(syncProfFail.json.message, 'sync-router profile_fail api.message');
+      assertNoLeakAndCapped(syncProfFail.json.data.routerLastSyncMessage, 'sync-router profile_fail data');
+      assert.equal(parsePendingSyncActions('failed', syncProfFail.json.data.routerLastSyncMessage).corrupted, false);
+
+      currentMode = 'verify_fail';
+      const syncVerFail = await apiInjected('POST', '/customers/c-sec-38-main/sync-router');
+      assert.equal(syncVerFail.status, 500);
+      assert.equal(syncVerFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(syncVerFail.json.message, 'sync-router verify_fail api.message');
+      assertNoLeakAndCapped(syncVerFail.json.data.routerLastSyncMessage, 'sync-router verify_fail data');
+      assert.equal(parsePendingSyncActions('failed', syncVerFail.json.data.routerLastSyncMessage).corrupted, false);
+
+      currentMode = 'cleanup_dc_fail';
+      const syncCleanDcFail = await apiInjected('POST', '/customers/c-sec-38-main/sync-router');
+      assert.equal(syncCleanDcFail.status, 502);
+      assert.equal(syncCleanDcFail.json.data.routerSyncStatus, 'failed');
+      assertNoLeakAndCapped(syncCleanDcFail.json.message, 'sync-router cleanup_dc_fail api.message');
+      assertNoLeakAndCapped(syncCleanDcFail.json.data.routerLastSyncMessage, 'sync-router cleanup_dc_fail data');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'sync-router cleanup_dc_fail DB');
+      const parsedAfterSyncFail = parsePendingSyncActions('failed', syncCleanDcFail.json.data.routerLastSyncMessage);
+      assert.equal(parsedAfterSyncFail.corrupted, false);
+      assert.equal(parsedAfterSyncFail.needsSessionDisconnect, true);
+      assert.deepEqual(parsedAfterSyncFail.oldAccounts, [{ type: 'pppoe', username: 'sec38_old_user' }]);
+
+      currentMode = 'oversized_ok';
+      const syncOk = await apiInjected('POST', '/customers/c-sec-38-main/sync-router');
+      assert.equal(syncOk.status, 200);
+      assert.equal(syncOk.json.data.routerSyncStatus, 'synced');
+      assertNoLeakAndCapped(syncOk.json.data.routerLastSyncMessage, 'sync-router oversized_ok data');
+      assertNoLeakAndCapped(dbStore.customers.get('c-sec-38-main')?.router_last_sync_message, 'sync-router oversized_ok DB');
+    } finally {
+      await new Promise<void>((resolve) => injectedServer.close(() => resolve()));
+    }
   });
 
   // Restore prototypes & stop servers cleanly

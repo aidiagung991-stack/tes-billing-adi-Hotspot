@@ -241,10 +241,121 @@ function mergeOldAccounts(
   return result;
 }
 
+const MAX_OPERATION_MESSAGE_LENGTH = 260;
+const MAX_SYNC_TEXT_LENGTH = 420;
+
+function truncateSafeMessage(text: string, maxLen: number): string {
+  const normalized = text
+    .replace(/[\x00-\x1F\x7F]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (normalized.length <= maxLen) return normalized;
+  return `${normalized.slice(0, Math.max(16, maxLen - 3)).trimEnd()}...`;
+}
+
+function containsUnsafeOperationalDetail(raw: string): boolean {
+  // 1. Penanda protokol mentah RouterOS (!trap, !fatal, atribut/perintah mentah)
+  if (/(!trap|!fatal|=message=|=ret=|=.id=)/i.test(raw)) return true;
+  if (/\/(ppp|ip\/hotspot|system|login|quit)\b/i.test(raw)) return true;
+
+  // 2. Kode / pesan mentah soket TCP & TLS
+  if (
+    /\b(ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|ECONNRESET|EPIPE|ECONNABORTED|SOCKET_INIT_FAILED|CONNECTION_CLOSED_PREMATURELY|ERR_TLS_[A-Z0-9_]+|ERR_SSL_[A-Z0-9_]+|ERR_STREAM_[A-Z0-9_]+)\b/i.test(
+      raw
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\b(socket hang up|read ECONNRESET|connect E[A-Z]+|SSL routines|certificate verify failed|connection refused|connection reset|getaddrinfo|could not connect to server)\b/i.test(
+      raw
+    )
+  ) {
+    return true;
+  }
+
+  // 3. Pola SQL / PostgreSQL / error database internal
+  if (/\b(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b[\s\S]{0,120}\b(FROM|INTO|TABLE|SET|WHERE)\b/i.test(raw)) {
+    return true;
+  }
+  if (
+    /\b(SQLSTATE|pg-protocol|pg_catalog|information_schema|duplicate key value|violates unique constraint|violates foreign key|syntax error at or near|relation\s+"[^"]+"|column\s+"[^"]+"|constraint\s+"[^"]+")\b/i.test(
+      raw
+    )
+  ) {
+    return true;
+  }
+  if (/postgres(?:ql)?:\/\//i.test(raw)) return true;
+
+  // 4. Stack trace / lokasi file internal Node.js
+  if (/(\r?\n\s*at\s+|\bat\s+[A-Za-z0-9_$.<>]+\s*\([^)]*\)|[A-Za-z0-9_./\\-]+\.(?:ts|js|mjs|cjs):\d+:\d+)/i.test(raw)) {
+    return true;
+  }
+  if (/\b(TypeError|ReferenceError|SyntaxError|RangeError):/i.test(raw)) {
+    return true;
+  }
+
+  // 5. Kredensial, password, token, ciphertext, API key, dan env secrets
+  if (/enc:v1:[0-9a-fA-F:]+/.test(raw)) return true;
+  if (/Bearer\s+[A-Za-z0-9._-]+/i.test(raw)) return true;
+  if (/(password|passwd|pwd|token|apikey|api_key|passphrase|authorization|credential)\s*[=:]/i.test(raw)) return true;
+  if (/(?:^|[^a-zA-Z])secret\s*[=:]/i.test(raw)) return true;
+  if (/\b(password|passwd|token|apikey|api_key|passphrase|access_token|refresh_token|secret_key|mikrotik_encryption_key|db_password)\b/i.test(raw)) {
+    return true;
+  }
+
+  const envSecrets = [
+    process.env.DB_PASSWORD,
+    process.env.MIKROTIK_ENCRYPTION_KEY,
+    process.env.WABLAS_API_TOKEN,
+    process.env.WABLAS_SECRET_KEY,
+  ];
+  for (const secret of envSecrets) {
+    if (secret && secret.trim().length >= 4 && raw.includes(secret.trim())) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Helper terpusat untuk mensanitasi pesan hasil operasi MikroTik ({ success/exists/verified, message }).
+ * Menolak dan mengganti pesan apabila mengandung !trap, !fatal, detail soket, SQL, stack trace,
+ * password, token, ciphertext, atau kredensial, sekaligus membatasi panjang pesan.
+ */
+export function sanitizeMikrotikOperationMessage(
+  rawMessage: unknown,
+  fallbackMessage: string,
+  maxLen: number = MAX_OPERATION_MESSAGE_LENGTH
+): string {
+  const safeFallback = truncateSafeMessage(
+    redactSensitiveText(fallbackMessage) || 'Operasi ke router MikroTik gagal diproses.',
+    maxLen
+  );
+  if (typeof rawMessage !== 'string') return safeFallback;
+
+  const trimmed = rawMessage.trim();
+  if (!trimmed) return safeFallback;
+
+  if (containsUnsafeOperationalDetail(trimmed)) {
+    return safeFallback;
+  }
+
+  const redacted = redactSensitiveText(trimmed);
+  if (!redacted) return safeFallback;
+  return truncateSafeMessage(redacted, maxLen);
+}
+
+function finalizeSafeSyncText(message: string, maxLen: number = MAX_SYNC_TEXT_LENGTH): string {
+  const clean = stripPendingMarkersFromMessage(message);
+  return truncateSafeMessage(redactSensitiveText(clean), maxLen);
+}
+
 function sanitizeSyncMessagePreservingMeta(message: string | null | undefined): string {
   if (!message || typeof message !== 'string') return '';
   const v1Tags = [...message.matchAll(/\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g)].map((m) => m[0]);
-  const cleanBody = redactSensitiveText(message.replace(/\s*\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g, ''));
+  const cleanBody = finalizeSafeSyncText(message.replace(/\s*\[SYNC_META_V1:[A-Za-z0-9_-]+\]/g, ''));
   if (v1Tags.length === 0) return cleanBody;
   return cleanBody ? `${cleanBody} ${v1Tags.join(' ')}` : v1Tags.join(' ');
 }
@@ -258,7 +369,7 @@ function appendPendingMarkers(
     stages?: PendingSyncStages;
   }
 ): string {
-  const cleanBase = redactSensitiveText(stripPendingMarkersFromMessage(baseMessage));
+  const cleanBase = finalizeSafeSyncText(baseMessage);
   if (!pending.corrupted && !pending.needsSessionDisconnect && pending.oldAccounts.length === 0) {
     return cleanBase;
   }
@@ -274,7 +385,36 @@ function appendPendingMarkers(
   return `${cleanBase} [SYNC_META_V1:${encoded}]`;
 }
 
-const router = Router();
+export interface MikrotikRouteDeps {
+  testMikrotikConnection: typeof testMikrotikConnection;
+  checkProfileExists: typeof checkProfileExists;
+  createOrUpdatePppoeSecret: typeof createOrUpdatePppoeSecret;
+  disconnectPppoeSession: typeof disconnectPppoeSession;
+  togglePppoeSecret: typeof togglePppoeSecret;
+  createOrUpdateHotspotUser: typeof createOrUpdateHotspotUser;
+  disconnectHotspotSession: typeof disconnectHotspotSession;
+  toggleHotspotUser: typeof toggleHotspotUser;
+  verifyPppoeSecretExists: typeof verifyPppoeSecretExists;
+  verifyHotspotUserExists: typeof verifyHotspotUserExists;
+  cleanupOldRouterAccount: typeof cleanupOldRouterAccount;
+}
+
+export function createDbRouter(mikrotikOverrides?: Partial<MikrotikRouteDeps>): Router {
+  const mtDeps: MikrotikRouteDeps = {
+    testMikrotikConnection,
+    checkProfileExists,
+    createOrUpdatePppoeSecret,
+    disconnectPppoeSession,
+    togglePppoeSecret,
+    createOrUpdateHotspotUser,
+    disconnectHotspotSession,
+    toggleHotspotUser,
+    verifyPppoeSecretExists,
+    verifyHotspotUserExists,
+    cleanupOldRouterAccount,
+    ...mikrotikOverrides,
+  };
+  const router = Router();
 
 // ============================================================================
 // 0. HELPER IDENTIFIKASI SCHEMA MIKROTIK (MIGRATION 003) & KREDENSIAL ROUTER
@@ -937,19 +1077,25 @@ router.post('/customers', async (req: Request, res: Response) => {
 
     // Verifikasi keberadaan profile pada RouterOS
     try {
-      const profileCheck = await checkProfileExists(routerOptions, cleanProfile, isHotspot ? 'hotspot' : 'pppoe');
+      const profileCheck = await mtDeps.checkProfileExists(routerOptions, cleanProfile, isHotspot ? 'hotspot' : 'pppoe');
       if (!profileCheck.exists) {
+        const safeProfileMsg = sanitizeMikrotikOperationMessage(
+          profileCheck.message,
+          `Profile ${isHotspot ? 'Hotspot' : 'PPPoE'} '${cleanProfile}' tidak ditemukan di router.`
+        );
         if (schema.customers) {
           await query(
             `UPDATE customers SET router_sync_status = 'failed', router_last_sync_message = $1 WHERE id = $2`,
-            [profileCheck.message, c.id]
+            [safeProfileMsg, c.id]
           );
           createdCustomer.routerSyncStatus = 'failed';
-          createdCustomer.routerLastSyncMessage = profileCheck.message;
+          createdCustomer.routerLastSyncMessage = safeProfileMsg;
         }
         return res.json({
           success: true,
-          message: `Data pelanggan tersimpan di PostgreSQL, namun sinkronisasi router gagal: ${profileCheck.message}`,
+          message: finalizeSafeSyncText(
+            `Data pelanggan tersimpan di PostgreSQL, namun sinkronisasi router gagal: ${safeProfileMsg}`
+          ),
           data: createdCustomer,
         });
       }
@@ -975,14 +1121,14 @@ router.post('/customers', async (req: Request, res: Response) => {
       const isDisabled = c.status !== 'active';
       let provResult;
       if (isHotspot) {
-        provResult = await createOrUpdateHotspotUser(routerOptions, {
+        provResult = await mtDeps.createOrUpdateHotspotUser(routerOptions, {
           username: cleanUsername,
           password: rawPasswordForRouter,
           profile: cleanProfile,
           disabled: isDisabled,
         });
       } else {
-        provResult = await createOrUpdatePppoeSecret(routerOptions, {
+        provResult = await mtDeps.createOrUpdatePppoeSecret(routerOptions, {
           username: cleanUsername,
           password: rawPasswordForRouter,
           profile: cleanProfile,
@@ -992,13 +1138,20 @@ router.post('/customers', async (req: Request, res: Response) => {
       }
 
       const verifyRes = isHotspot
-        ? await verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
-        : await verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
+        ? await mtDeps.verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
+        : await mtDeps.verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
       if (!verifyRes.verified) {
-        throw new SafeOperationalError('ROUTEROS_TRAP', verifyRes.message);
+        const safeVerifyMsg = sanitizeMikrotikOperationMessage(
+          verifyRes.message,
+          `Verifikasi akun '${cleanUsername}' di router MikroTik gagal.`
+        );
+        throw new SafeOperationalError('ROUTEROS_TRAP', safeVerifyMsg);
       }
 
-      const safeProvMessage = redactSensitiveText(provResult.message);
+      const safeProvMessage = sanitizeMikrotikOperationMessage(
+        provResult.message,
+        `Akun ${isHotspot ? 'Hotspot' : 'PPPoE'} '${cleanUsername}' berhasil disinkronkan ke router MikroTik.`
+      );
       if (schema.customers) {
         await query(
           `UPDATE customers 
@@ -1022,7 +1175,7 @@ router.post('/customers', async (req: Request, res: Response) => {
       // PENTING: Kegagalan komunikasi router TIDAK PERNAH membatalkan/menghapus data pelanggan dari PostgreSQL
       const safeRouter = sanitizeMikrotikError(routerErr, 'Koneksi API router mengalami gangguan.');
       logSafeServerError('POST /api/customers/sync', safeRouter.code, { resourceId: c.id });
-      const safeErrorMsg = redactSensitiveText(`Gagal sinkronisasi router: ${safeRouter.message}`);
+      const safeErrorMsg = finalizeSafeSyncText(`Gagal sinkronisasi router: ${safeRouter.message}`);
       if (schema.customers) {
         await query(
           `UPDATE customers 
@@ -1040,7 +1193,9 @@ router.post('/customers', async (req: Request, res: Response) => {
       res.json({
         success: true,
         errorCode: safeRouter.code,
-        message: `Pelanggan berhasil disimpan ke PostgreSQL, namun sinkronisasi router gagal: ${safeErrorMsg}`,
+        message: finalizeSafeSyncText(
+          `Pelanggan berhasil disimpan ke PostgreSQL, namun sinkronisasi router gagal: ${safeErrorMsg}`
+        ),
         data: createdCustomer,
       });
     }
@@ -1281,10 +1436,14 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
       } else {
         const cleanProfile = profileToUse.trim();
         try {
-          const profileCheck = await checkProfileExists(routerOptions, cleanProfile, targetType);
+          const profileCheck = await mtDeps.checkProfileExists(routerOptions, cleanProfile, targetType);
           if (!profileCheck.exists) {
             // Profile tidak ada di router -> Jangan hapus akun lama & jangan memutus sesi, tandai failed
-            const errMsg = appendPendingMarkers(profileCheck.message, {
+            const safeProfileMsg = sanitizeMikrotikOperationMessage(
+              profileCheck.message,
+              `Profile ${isHotspot ? 'Hotspot' : 'PPPoE'} '${cleanProfile}' tidak ditemukan di router.`
+            );
+            const errMsg = appendPendingMarkers(safeProfileMsg, {
               needsSessionDisconnect: pendingDisconnectNeeded,
               oldAccounts: pendingOldAccounts,
               corrupted: prevPending.corrupted,
@@ -1306,14 +1465,14 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
               // TAHAP 1: Buat atau perbarui akun BARU secara idempotent
               let provResult;
               if (isHotspot) {
-                provResult = await createOrUpdateHotspotUser(routerOptions, {
+                provResult = await mtDeps.createOrUpdateHotspotUser(routerOptions, {
                   username: cleanUsername,
                   password: rawPasswordForRouter || undefined,
                   profile: cleanProfile,
                   disabled: isDisabled,
                 });
               } else {
-                provResult = await createOrUpdatePppoeSecret(routerOptions, {
+                provResult = await mtDeps.createOrUpdatePppoeSecret(routerOptions, {
                   username: cleanUsername,
                   password: rawPasswordForRouter || undefined,
                   profile: cleanProfile,
@@ -1327,21 +1486,30 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
               // TAHAP 2: Verifikasi akun BARU benar-benar tunggal & sesuai di RouterOS SEBELUM menyentuh akun lama
               stageReached = 'verify';
               const verifyRes = isHotspot
-                ? await verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
-                : await verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
+                ? await mtDeps.verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
+                : await mtDeps.verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
 
               if (!verifyRes.verified) {
-                throw new SafeOperationalError('ROUTEROS_TRAP', verifyRes.message);
+                const safeVerifyMsg = sanitizeMikrotikOperationMessage(
+                  verifyRes.message,
+                  `Verifikasi akun '${cleanUsername}' di router MikroTik gagal.`
+                );
+                throw new SafeOperationalError('ROUTEROS_TRAP', safeVerifyMsg);
               }
 
               // TAHAP 3: Bersihkan akun LAMA (hanya setelah akun baru dibuat & diverifikasi)
               const failedOldAccounts: PendingRouterAccount[] = [];
               const cleanupErrors: string[] = [];
               for (const oldAcc of pendingOldAccounts) {
-                const cleanupRes = await cleanupOldRouterAccount(routerOptions, oldAcc.type, oldAcc.username);
+                const cleanupRes = await mtDeps.cleanupOldRouterAccount(routerOptions, oldAcc.type, oldAcc.username);
                 if (!cleanupRes.success) {
                   failedOldAccounts.push(oldAcc);
-                  cleanupErrors.push(cleanupRes.message);
+                  cleanupErrors.push(
+                    sanitizeMikrotikOperationMessage(
+                      cleanupRes.message,
+                      `Gagal membersihkan akun lama '${oldAcc.username}' di router.`
+                    )
+                  );
                 }
               }
 
@@ -1351,11 +1519,14 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
               if (effectiveDisconnectNeeded) {
                 try {
                   const dcRes = isHotspot
-                    ? await disconnectHotspotSession(routerOptions, cleanUsername)
-                    : await disconnectPppoeSession(routerOptions, cleanUsername);
+                    ? await mtDeps.disconnectHotspotSession(routerOptions, cleanUsername)
+                    : await mtDeps.disconnectPppoeSession(routerOptions, cleanUsername);
                   if (!dcRes.success) {
                     sessionDisconnectFailed = true;
-                    sessionDisconnectError = redactSensitiveText(dcRes.message);
+                    sessionDisconnectError = sanitizeMikrotikOperationMessage(
+                      dcRes.message,
+                      `Gagal memutuskan sesi aktif '${cleanUsername}' di router.`
+                    );
                   }
                 } catch (dcErr: any) {
                   const safeDc = sanitizeMikrotikError(dcErr, 'Gagal memutuskan sesi aktif pelanggan di router.');
@@ -1410,7 +1581,7 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
                   if (effectiveDisconnectNeeded) {
                     syncDetails.push('seluruh sesi aktif diputus untuk menerapkan profile/status terbaru');
                   }
-                  const syncMsg = redactSensitiveText(
+                  const syncMsg = finalizeSafeSyncText(
                     `Akun '${cleanUsername}' (${targetType.toUpperCase()}) berhasil dibuat/diperbarui & diverifikasi di router MikroTik${
                       syncDetails.length > 0 ? ` (${syncDetails.join(', ')})` : ''
                     }.`
@@ -1608,19 +1779,24 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
     } else {
       try {
         if (isHotspot) {
-          await toggleHotspotUser(routerOptions, cleanUsername, isDisabled);
+          await mtDeps.toggleHotspotUser(routerOptions, cleanUsername, isDisabled);
         } else {
-          await togglePppoeSecret(routerOptions, cleanUsername, isDisabled);
+          await mtDeps.togglePppoeSecret(routerOptions, cleanUsername, isDisabled);
         }
 
         // Proses pembersihan akun lama yang masih tertunda sebelum menyatakan selesai
         const remainingOldAccounts: PendingRouterAccount[] = [];
         const cleanupErrors: string[] = [];
         for (const oldAcc of pendingOldAccounts) {
-          const cleanupRes = await cleanupOldRouterAccount(routerOptions, oldAcc.type, oldAcc.username);
+          const cleanupRes = await mtDeps.cleanupOldRouterAccount(routerOptions, oldAcc.type, oldAcc.username);
           if (!cleanupRes.success) {
             remainingOldAccounts.push(oldAcc);
-            cleanupErrors.push(cleanupRes.message);
+            cleanupErrors.push(
+              sanitizeMikrotikOperationMessage(
+                cleanupRes.message,
+                `Gagal membersihkan akun lama '${oldAcc.username}' di router.`
+              )
+            );
           }
         }
 
@@ -1630,11 +1806,14 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
         if (pendingDisconnect) {
           try {
             const dcRes = isHotspot
-              ? await disconnectHotspotSession(routerOptions, cleanUsername)
-              : await disconnectPppoeSession(routerOptions, cleanUsername);
+              ? await mtDeps.disconnectHotspotSession(routerOptions, cleanUsername)
+              : await mtDeps.disconnectPppoeSession(routerOptions, cleanUsername);
             if (!dcRes.success) {
               remainingSessionDisconnect = true;
-              sessionDisconnectError = dcRes.message;
+              sessionDisconnectError = sanitizeMikrotikOperationMessage(
+                dcRes.message,
+                `Gagal memutuskan sesi aktif '${cleanUsername}' di router.`
+              );
             }
           } catch (dcErr: any) {
             const safeDc = sanitizeMikrotikError(dcErr, 'Gagal memutuskan sesi aktif tertunda di router.');
@@ -1681,7 +1860,7 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
           if (pendingDisconnect) {
             syncNotes.push('seluruh sesi aktif diperiksa & diputus');
           }
-          const syncMsg = redactSensitiveText(
+          const syncMsg = finalizeSafeSyncText(
             `Status akun di router berhasil diubah menjadi ${isDisabled ? 'nonaktif (disabled)' : 'aktif'}${
               syncNotes.length > 0 ? ` (${syncNotes.join(', ')})` : ''
             }.`
@@ -1871,9 +2050,13 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
     const cleanProfile = profileToUse.trim();
 
     // Verifikasi profile ada di router
-    const profileCheck = await checkProfileExists(routerOptions, cleanProfile, targetType);
+    const profileCheck = await mtDeps.checkProfileExists(routerOptions, cleanProfile, targetType);
     if (!profileCheck.exists) {
-      const errMsg = appendPendingMarkers(profileCheck.message, {
+      const safeProfileMsg = sanitizeMikrotikOperationMessage(
+        profileCheck.message,
+        `Profile ${isHotspot ? 'Hotspot' : 'PPPoE'} '${cleanProfile}' tidak ditemukan di router.`
+      );
+      const errMsg = appendPendingMarkers(safeProfileMsg, {
         needsSessionDisconnect,
         oldAccounts: pendingOldAccounts,
       });
@@ -1890,14 +2073,14 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
     // TAHAP 1: Eksekusi provisioning idempotent (ADD atau SET tanpa duplikasi, menolak jika akun duplikat)
     let provResult;
     if (isHotspot) {
-      provResult = await createOrUpdateHotspotUser(routerOptions, {
+      provResult = await mtDeps.createOrUpdateHotspotUser(routerOptions, {
         username: cleanUsername,
         password: rawPassword,
         profile: cleanProfile,
         disabled: isDisabled,
       });
     } else {
-      provResult = await createOrUpdatePppoeSecret(routerOptions, {
+      provResult = await mtDeps.createOrUpdatePppoeSecret(routerOptions, {
         username: cleanUsername,
         password: rawPassword,
         profile: cleanProfile,
@@ -1912,20 +2095,29 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
 
     // TAHAP 2: Verifikasi akun tunggal benar-benar ada & sesuai (profile + status disabled) di RouterOS
     const verifyRes = isHotspot
-      ? await verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
-      : await verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
+      ? await mtDeps.verifyHotspotUserExists(routerOptions, cleanUsername, cleanProfile, isDisabled)
+      : await mtDeps.verifyPppoeSecretExists(routerOptions, cleanUsername, cleanProfile, isDisabled);
     if (!verifyRes.verified) {
-      throw new SafeOperationalError('ROUTEROS_TRAP', verifyRes.message);
+      const safeVerifyMsg = sanitizeMikrotikOperationMessage(
+        verifyRes.message,
+        `Verifikasi akun '${cleanUsername}' di router MikroTik gagal.`
+      );
+      throw new SafeOperationalError('ROUTEROS_TRAP', safeVerifyMsg);
     }
 
     // TAHAP 3: Ulangi pembersihan akun lama jika kegagalan sebelumnya meninggalkan akun lama / sesi akun lama
     const failedOldAccounts: PendingRouterAccount[] = [];
     const cleanupErrors: string[] = [];
     for (const oldAcc of pendingOldAccounts) {
-      const cleanupRes = await cleanupOldRouterAccount(routerOptions, oldAcc.type, oldAcc.username);
+      const cleanupRes = await mtDeps.cleanupOldRouterAccount(routerOptions, oldAcc.type, oldAcc.username);
       if (!cleanupRes.success) {
         failedOldAccounts.push(oldAcc);
-        cleanupErrors.push(cleanupRes.message);
+        cleanupErrors.push(
+          sanitizeMikrotikOperationMessage(
+            cleanupRes.message,
+            `Gagal membersihkan akun lama '${oldAcc.username}' di router.`
+          )
+        );
       }
     }
 
@@ -1941,11 +2133,14 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
     if (shouldDisconnectTargetSession) {
       try {
         const dcRes = isHotspot
-          ? await disconnectHotspotSession(routerOptions, cleanUsername)
-          : await disconnectPppoeSession(routerOptions, cleanUsername);
+          ? await mtDeps.disconnectHotspotSession(routerOptions, cleanUsername)
+          : await mtDeps.disconnectPppoeSession(routerOptions, cleanUsername);
         if (!dcRes.success) {
           sessionDisconnectFailed = true;
-          sessionDisconnectError = redactSensitiveText(dcRes.message);
+          sessionDisconnectError = sanitizeMikrotikOperationMessage(
+            dcRes.message,
+            `Gagal memutuskan sesi aktif '${cleanUsername}' di router.`
+          );
         } else if (dcRes.disconnectedCount > 0) {
           sessionDisconnectSummary = `${dcRes.disconnectedCount} sesi aktif diputus`;
         }
@@ -2010,7 +2205,11 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
       finalDetails.push('pembersihan akun lama selesai');
     }
     finalDetails.push(sessionDisconnectSummary);
-    const finalMsg = redactSensitiveText(`${provResult.message} (${finalDetails.join(', ')})`);
+    const safeProvMsg = sanitizeMikrotikOperationMessage(
+      provResult.message,
+      `Akun ${isHotspot ? 'Hotspot' : 'PPPoE'} '${cleanUsername}' berhasil disinkronkan ke router MikroTik.`
+    );
+    const finalMsg = finalizeSafeSyncText(`${safeProvMsg} (${finalDetails.join(', ')})`);
     const nowIso = new Date().toISOString();
 
     if (schema.customers) {
@@ -2947,7 +3146,9 @@ router.get('/mikrotik/config', async (_req: Request, res: Response) => {
         timeoutSeconds: Number(row.timeoutSeconds) || 10,
         notes: row.notes || '',
         lastTestedAt: row.lastTestedAt,
-        lastStatusMessage: row.lastStatusMessage ? redactSensitiveText(row.lastStatusMessage) : row.lastStatusMessage,
+        lastStatusMessage: row.lastStatusMessage
+          ? sanitizeMikrotikOperationMessage(row.lastStatusMessage, 'Status koneksi router tidak tersedia.', 320)
+          : row.lastStatusMessage,
         isPasswordConfigured: Boolean(row.isPasswordConfigured),
         // Proteksi keamanan: Hanya kirim mask placeholder jika password sudah tersimpan,
         // password asli atau password_encrypted TIDAK PERNAH dikirim ke frontend.
@@ -3116,7 +3317,7 @@ router.post('/mikrotik/test-connection', async (req: Request, res: Response) => 
     }
 
     // Eksekusi koneksi RouterOS API nyata
-    const result = await testMikrotikConnection({
+    const result = await mtDeps.testMikrotikConnection({
       host: targetHost,
       port: targetPort,
       username: targetUsername,
@@ -3128,6 +3329,11 @@ router.post('/mikrotik/test-connection', async (req: Request, res: Response) => 
     if (result.success) {
       // Perbarui status router di database menjadi connected
       const versionDisplay = result.data?.version ? `RouterOS ${result.data.version}` : null;
+      const safeSuccessMsg = sanitizeMikrotikOperationMessage(
+        result.message,
+        'Koneksi RouterOS API berhasil! Autentikasi terverifikasi.',
+        320
+      );
       await query(
         `
         UPDATE mikrotik_settings
@@ -3139,17 +3345,21 @@ router.post('/mikrotik/test-connection', async (req: Request, res: Response) => 
           updated_at = CURRENT_TIMESTAMP
         WHERE id = 'default'
         `,
-        [result.message, versionDisplay]
+        [safeSuccessMsg, versionDisplay]
       );
 
       res.json({
         success: true,
-        message: result.message,
+        message: safeSuccessMsg,
         data: result.data,
       });
     } else {
       // Perbarui status router di database menjadi disconnected
-      const safeStatusMsg = redactSensitiveText(result.message);
+      const safeStatusMsg = sanitizeMikrotikOperationMessage(
+        result.message,
+        'Gagal terhubung ke router MikroTik.',
+        320
+      );
       const safeErrorCode = result.errorDetails ? toAllowedErrorCode(result.errorDetails) : undefined;
       await query(
         `
@@ -3182,6 +3392,10 @@ router.post('/mikrotik/test-connection', async (req: Request, res: Response) => 
   }
 });
 
+  return router;
+}
+
+const router = createDbRouter();
 export default router;
 
 
