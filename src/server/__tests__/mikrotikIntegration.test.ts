@@ -861,7 +861,17 @@ async function main() {
     disconnectHotspotSession,
     createOrUpdatePppoeSecret,
   } = await import('../mikrotikService.js');
-  const { ALLOWED_ERROR_CODES, sanitizeSocketErrorCode, redactSensitiveText } = await import('../errorSanitizer.js');
+  const {
+    ALLOWED_ERROR_CODES,
+    ALLOWED_SOCKET_ERROR_CODES,
+    SafeOperationalError,
+    sanitizeSocketErrorCode,
+    sanitizeDatabaseError,
+    sanitizeMikrotikError,
+    sanitizeGenericServerError,
+    redactSensitiveText,
+    logSafeServerError,
+  } = await import('../errorSanitizer.js');
   const dbRoutesModule = await import('../dbRoutes.js');
   const { parsePendingSyncActions, sanitizeMikrotikOperationMessage, createDbRouter } = dbRoutesModule;
 
@@ -2410,6 +2420,234 @@ async function main() {
     } finally {
       await new Promise<void>((resolve) => injectedServer.close(() => resolve()));
     }
+  });
+
+  // Skenario 39: SafeOperationalError mensanitasi pesan sebelum super(), memvalidasi allowlist kode & isFatal secara ketat
+  await runScenario(39, 'Audit errorSanitizer: SafeOperationalError menyamakan .message/.safeMessage/.stack terbersihkan & validasi allowlist + isFatal', async () => {
+    const rawDanger =
+      'Gagal proses password=TOP_SECRET_39 token=TOK_39 enc:v1:aa:bb:cc SELECT * FROM users\n    at secretFn (/app/src/server/dbRoutes.ts:10:2)';
+    const err = new SafeOperationalError('UNKNOWN_RAW_CODE' as any, rawDanger, { isFatal: 'yes' as any });
+
+    assert.equal(err.code, 'INTERNAL_ERROR', 'Kode error tidak dikenal harus diganti kode allowlist');
+    assert.ok(ALLOWED_ERROR_CODES.includes(err.code));
+    assert.equal(err.message, err.safeMessage, 'error.message harus persis sama dengan error.safeMessage');
+    assert.equal(err.isFatal, false, 'Kode tidak dikenal & opsi non-boolean tidak boleh membuat isFatal=true');
+
+    const serialized = `${err.message} | ${err.safeMessage} | ${err.toString()} | ${err.stack || ''}`;
+    for (const forbidden of ['TOP_SECRET_39', 'TOK_39', 'enc:v1:aa:bb:cc', 'SELECT * FROM', 'secretFn']) {
+      assert.ok(!serialized.includes(forbidden), `SafeOperationalError membocorkan "${forbidden}" pada properti Error!`);
+    }
+
+    // Validasi aturan isFatal
+    const fatalInvalidCode = new SafeOperationalError('BAD_CODE' as any, 'Pesan aman', { isFatal: true });
+    assert.equal(fatalInvalidCode.code, 'INTERNAL_ERROR');
+    assert.equal(fatalInvalidCode.isFatal, false, 'Kode tidak valid tidak boleh menjadi fatal meskipun isFatal=true');
+
+    const fatalValid = new SafeOperationalError('ROUTEROS_FATAL', 'Koneksi dihentikan router.');
+    assert.equal(fatalValid.code, 'ROUTEROS_FATAL');
+    assert.equal(fatalValid.isFatal, true);
+    assert.equal(fatalValid.message, fatalValid.safeMessage);
+  });
+
+  // Skenario 40: Sanitasi fallbackMessage pada sanitizeDatabaseError, sanitizeMikrotikError, dan sanitizeGenericServerError
+  await runScenario(40, 'Audit errorSanitizer: Fallback berisi password/token/ciphertext/SQL/stack trace tidak bocor di ketiga sanitizer', async () => {
+    const dirtyFallback =
+      'Fallback bocor password=FALLBACK_PASS token=FALLBACK_TOK enc:v1:11:22:33 SELECT password_encrypted FROM mikrotik_settings\n    at badCaller (/app/src/server/db.ts:99:1) ' +
+      'P'.repeat(400);
+
+    const dbBranches: any[] = [
+      Object.assign(new Error('dup'), { code: '23505' }),
+      Object.assign(new Error('fk'), { code: '23503' }),
+      Object.assign(new Error('chk'), { code: '23514' }),
+      Object.assign(new Error('conn'), { code: '08006' }),
+      Object.assign(new Error('qry'), { code: '42P01' }),
+      new SafeOperationalError('DB_QUERY_ERROR', dirtyFallback, { statusCode: 500 }),
+    ];
+    for (const sample of dbBranches) {
+      const res = sanitizeDatabaseError(sample, dirtyFallback);
+      for (const forbidden of ['FALLBACK_PASS', 'FALLBACK_TOK', 'enc:v1:11:22:33', 'SELECT password_encrypted', 'badCaller']) {
+        assert.ok(!res.message.includes(forbidden), `sanitizeDatabaseError membocorkan "${forbidden}"`);
+      }
+      assert.ok(res.message.length <= 320);
+    }
+
+    const mtBranches: any[] = [
+      Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }),
+      Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }),
+      Object.assign(new Error('tls'), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }),
+      new Error('unknown internal raw error'),
+      new SafeOperationalError('ROUTEROS_TRAP', dirtyFallback),
+    ];
+    for (const sample of mtBranches) {
+      const res = sanitizeMikrotikError(sample, dirtyFallback);
+      for (const forbidden of ['FALLBACK_PASS', 'FALLBACK_TOK', 'enc:v1:11:22:33', 'SELECT password_encrypted', 'badCaller']) {
+        assert.ok(!res.message.includes(forbidden), `sanitizeMikrotikError membocorkan "${forbidden}"`);
+      }
+      assert.ok(res.message.length <= 320);
+    }
+
+    const genBranches: any[] = [
+      new Error('raw server failure'),
+      Object.assign(new Error('pg err'), { code: '23505' }),
+      new SafeOperationalError('INTERNAL_ERROR', dirtyFallback, { statusCode: 500 }),
+    ];
+    for (const sample of genBranches) {
+      const res = sanitizeGenericServerError(sample, dirtyFallback);
+      for (const forbidden of ['FALLBACK_PASS', 'FALLBACK_TOK', 'enc:v1:11:22:33', 'SELECT password_encrypted', 'badCaller']) {
+        assert.ok(!res.message.includes(forbidden), `sanitizeGenericServerError membocorkan "${forbidden}"`);
+      }
+      assert.ok(res.message.length <= 320);
+    }
+
+    // Fallback bisnis aman tetap dipertahankan
+    const safeDb = sanitizeDatabaseError(Object.assign(new Error('raw'), { code: '23505' }), 'Gagal menyimpan data pelanggan.');
+    assert.ok(safeDb.message.startsWith('Gagal menyimpan data pelanggan.'));
+  });
+
+  // Skenario 41: Redaksi kredensial diperluas tanpa merusak pesan operasional aman maupun penanda SYNC_META_V1
+  await runScenario(41, 'Audit errorSanitizer: redactSensitiveText menangani JSON, quoted key-value, Bearer, PostgreSQL URI, enc:v1, stack, & pertahankan SYNC_META_V1', async () => {
+    const prevWablasToken = process.env.WABLAS_API_TOKEN;
+    process.env.WABLAS_API_TOKEN = 'WABLAS_LIVE_TOKEN_XYZ_987';
+    try {
+      const payload = Buffer.from(
+        JSON.stringify({ v: 1, needsSessionDisconnect: true, oldAccounts: [{ type: 'pppoe', username: 'user,khusus#1' }] }),
+        'utf8'
+      ).toString('base64url');
+      const metaTag = `[SYNC_META_V1:${payload}]`;
+
+      const complexInput = [
+        '{"password":"JsonPass!@#1","passwd":"Passwd!2","pwd":"PwdValue_3"}',
+        "{'client_secret':'ClientSec!@#','api-key':'ApiKey-777','access_token':'AccTok_888','refresh_token':'RefTok_999'}",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig",
+        "secret='Quoted Secret $#!' apikey=RawApiKey#42 api_key=SnakeKey$9 token=PlainTok!1",
+        'postgresql://dbuser:SuperPgP@ss!2026@internal-db.local:5432/adi_hotspot?sslmode=require',
+        'enc:v1:aabbccddeeff001122334455:6677889900aabbccddeeff11:1234567890abcdef',
+        `env=${process.env.WABLAS_API_TOKEN} db=${process.env.DB_PASSWORD} key=${process.env.MIKROTIK_ENCRYPTION_KEY}`,
+        'Error internal\n    at queryHandler (/app/src/server/dbRoutes.ts:512:14)',
+        metaTag,
+      ].join(' ');
+
+      const redacted = redactSensitiveText(complexInput);
+      const mustNotContain = [
+        'JsonPass!@#1',
+        'Passwd!2',
+        'PwdValue_3',
+        'ClientSec!@#',
+        'ApiKey-777',
+        'AccTok_888',
+        'RefTok_999',
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
+        'Quoted Secret $#!',
+        'RawApiKey#42',
+        'SnakeKey$9',
+        'PlainTok!1',
+        'dbuser:SuperPgP@ss!2026',
+        'internal-db.local',
+        'aabbccddeeff001122334455',
+        'WABLAS_LIVE_TOKEN_XYZ_987',
+        String(process.env.DB_PASSWORD),
+        String(process.env.MIKROTIK_ENCRYPTION_KEY),
+        'queryHandler',
+        '/app/src/server/dbRoutes.ts',
+      ];
+      for (const secret of mustNotContain) {
+        assert.ok(!redacted.includes(secret), `redactSensitiveText gagal menyensor "${secret}" -> hasil: ${redacted}`);
+      }
+      assert.ok(redacted.includes(metaTag), 'SYNC_META_V1 tidak boleh rusak oleh redaksi');
+
+      const parsedMeta = parsePendingSyncActions('failed', redacted);
+      assert.equal(parsedMeta.corrupted, false);
+      assert.equal(parsedMeta.needsSessionDisconnect, true);
+      assert.deepEqual(parsedMeta.oldAccounts, [{ type: 'pppoe', username: 'user,khusus#1' }]);
+
+      // Pesan operasional aman tidak boleh rusak atau hilang
+      const safeOps = [
+        "Profile MikroTik 'paket-10mbps' tidak ditemukan pada router.",
+        'Koneksi timeout ke router 10.10.1.1:8728.',
+        'Autentikasi MikroTik gagal (username atau password salah).',
+      ];
+      for (const msg of safeOps) {
+        assert.equal(redactSensitiveText(msg), msg, `Pesan operasional aman tidak boleh hilang/berubah: ${msg}`);
+      }
+    } finally {
+      if (prevWablasToken === undefined) {
+        delete process.env.WABLAS_API_TOKEN;
+      } else {
+        process.env.WABLAS_API_TOKEN = prevWablasToken;
+      }
+    }
+  });
+
+  // Skenario 42: Allowlist kode socket terpisah tidak salah mengklasifikasikan kode DB atau RouterOS
+  await runScenario(42, 'Audit errorSanitizer: sanitizeSocketErrorCode pakai allowlist socket terpisah & tidak salah klasifikasi kode DB/RouterOS', async () => {
+    const validSockets = [
+      'ECONNREFUSED',
+      'ETIMEDOUT',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'ENOTFOUND',
+      'ECONNRESET',
+      'EPIPE',
+      'TLS_ERROR',
+    ];
+    for (const code of validSockets) {
+      const mapped = sanitizeSocketErrorCode({ code });
+      assert.equal(mapped, code);
+      assert.ok((ALLOWED_SOCKET_ERROR_CODES as readonly string[]).includes(mapped));
+    }
+
+    const nonSocketCodes = ['DB_QUERY_ERROR', 'DB_CONSTRAINT_ERROR', 'ROUTEROS_TRAP', 'INTERNAL_ERROR', 'VALIDATION_ERROR', '42P01'];
+    for (const nonSocket of nonSocketCodes) {
+      const mapped = sanitizeSocketErrorCode({ code: nonSocket, message: 'tls certificate mention inside db message' });
+      assert.equal(mapped, 'NETWORK_ERROR', `Kode non-socket "${nonSocket}" tidak boleh diklasifikasikan sebagai kode socket (${mapped})`);
+    }
+    assert.equal(sanitizeSocketErrorCode({ code: 'UNKNOWN_99', message: 'unexpected io failure' }), 'NETWORK_ERROR');
+    assert.equal(sanitizeSocketErrorCode({ code: 'UNKNOWN_SSL', message: 'SSL handshake certificate error' }), 'TLS_ERROR');
+  });
+
+  // Skenario 43: logSafeServerError memblokir log injection, newline, SQL, kredensial, username/body, & membatasi panjang
+  await runScenario(43, 'Audit errorSanitizer: logSafeServerError mencegah newline injection, rahasia, SQL, stack, & memvalidasi allowlist kode', async () => {
+    const capturedLogs: string[] = [];
+    const origConsoleError = console.error;
+    console.error = (...args: any[]) => {
+      capturedLogs.push(args.map((a) => String(a)).join(' '));
+    };
+
+    try {
+      logSafeServerError(
+        'POST /api/customers\r\nFAKE_INJECTED_LOG {"password":"SecretCtx"}\n    at fn (/app/src/server/x.ts:1:1)',
+        'UNSAFE_CUSTOM_CODE',
+        {
+          operation: 'SELECT password_encrypted FROM customers\nWHERE id=1',
+          resourceId: 'cust01\r\ntoken=LEAK_ID {"username":"budi_pelanggan"} ' + 'X'.repeat(200),
+        }
+      );
+
+      logSafeServerError('POST /api/customers/sync', 'ROUTEROS_TRAP', {
+        operation: 'UPDATE',
+        resourceId: 'c-safe-43',
+      });
+    } finally {
+      console.error = origConsoleError;
+    }
+
+    assert.equal(capturedLogs.length, 2);
+    const maliciousLog = capturedLogs[0];
+    assert.ok(!/[\r\n]/.test(maliciousLog), 'Log tidak boleh mengandung newline / CRLF injection');
+    for (const forbidden of ['FAKE_INJECTED_LOG', 'SecretCtx', 'SELECT password_encrypted', 'LEAK_ID', 'budi_pelanggan', 'UNSAFE_CUSTOM_CODE', 'x.ts']) {
+      assert.ok(!maliciousLog.includes(forbidden), `AuditLog membocorkan "${forbidden}": ${maliciousLog}`);
+    }
+    const parsedBad = JSON.parse(maliciousLog.replace(/^\[Adi_Hotspot AuditLog\]\s*/, ''));
+    assert.equal(parsedBad.code, 'INTERNAL_ERROR');
+    assert.ok(parsedBad.context.length <= 80);
+    assert.ok((parsedBad.operation || '').length <= 24);
+    assert.ok((parsedBad.resourceId || '').length <= 64);
+
+    const safeLog = JSON.parse(capturedLogs[1].replace(/^\[Adi_Hotspot AuditLog\]\s*/, ''));
+    assert.equal(safeLog.code, 'ROUTEROS_TRAP');
+    assert.equal(safeLog.context, 'POST /api/customers/sync');
+    assert.equal(safeLog.operation, 'UPDATE');
+    assert.equal(safeLog.resourceId, 'c-safe-43');
   });
 
   // Restore prototypes & stop servers cleanly
