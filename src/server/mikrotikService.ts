@@ -218,18 +218,51 @@ export async function testMikrotikConnection(
     let isFinished = false;
     let accumulatedBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
 
-    const finish = (result: MikrotikConnectionResult) => {
-      if (isFinished) return;
-      isFinished = true;
+    const cleanupSocket = (graceful = false) => {
+      clearTimeout(timer);
       if (socket) {
+        const s = socket;
+        socket = null;
         try {
-          socket.removeAllListeners();
-          socket.destroy();
+          s.removeAllListeners('data');
+          s.removeAllListeners('timeout');
+          s.removeAllListeners('close');
+          s.removeAllListeners('end');
+          s.removeAllListeners('connect');
+          s.removeAllListeners('secureConnect');
+          s.removeAllListeners('error');
+          // Pasang error sink sebelum teardown agar ECONNRESET/EPIPE asinkron saat teardown tidak unhandled
+          s.on('error', () => {
+            // ignore teardown error after settle
+          });
+          if (!s.destroyed) {
+            if (graceful && s.writable) {
+              const forceTimer = setTimeout(() => {
+                if (!s.destroyed) {
+                  try {
+                    s.destroy();
+                  } catch {
+                    // ignore
+                  }
+                }
+              }, 50);
+              forceTimer.unref();
+              s.once('close', () => clearTimeout(forceTimer));
+              s.end();
+            } else {
+              s.destroy();
+            }
+          }
         } catch {
           // ignore
         }
-        socket = null;
       }
+    };
+
+    const finish = (result: MikrotikConnectionResult, graceful = false) => {
+      if (isFinished) return;
+      isFinished = true;
+      cleanupSocket(graceful);
       resolve(result);
     };
 
@@ -329,25 +362,33 @@ export async function testMikrotikConnection(
       testedAt: new Date().toISOString(),
     };
 
+    function safeWrite(sentenceToSend: string[]) {
+      if (!isFinished && socket && !socket.destroyed && socket.writable) {
+        socket.write(encodeSentence(sentenceToSend));
+      }
+    }
+
     function onConnected() {
       // Langkah 1: Kirim /login dengan username dan password (standar RouterOS v6.43+ dan RouterOS v7)
       currentStep = 'login_sent';
       const loginSentence = ['/login', `=name=${username}`, `=password=${password}`];
-      socket?.write(encodeSentence(loginSentence));
+      safeWrite(loginSentence);
     }
 
     socket.on('data', (chunk: Buffer) => {
+      if (isFinished) return;
       accumulatedBuffer = Buffer.concat([accumulatedBuffer, chunk]);
       const { sentences, remaining } = extractSentences(accumulatedBuffer);
       accumulatedBuffer = remaining;
 
       for (const sentence of sentences) {
+        if (isFinished) break;
         handleSentence(sentence);
       }
     });
 
     function handleSentence(sentence: string[]) {
-      if (sentence.length === 0) return;
+      if (isFinished || sentence.length === 0) return;
       const replyType = sentence[0];
 
       if (replyType === '!fatal') {
@@ -372,13 +413,13 @@ export async function testMikrotikConnection(
               .update(Buffer.concat([Buffer.from([0x00]), Buffer.from(password, 'utf8'), Buffer.from(challengeHex, 'hex')]))
               .digest('hex');
             const respWord = `=response=00${md5Hash}`;
-            socket?.write(encodeSentence(['/login', `=name=${username}`, respWord]));
+            safeWrite(['/login', `=name=${username}`, respWord]);
             return;
           }
 
           // Autentikasi berhasil pada RouterOS modern! Lanjut baca identitas router
           currentStep = 'get_identity';
-          socket?.write(encodeSentence(['/system/identity/print']));
+          safeWrite(['/system/identity/print']);
           return;
         }
 
@@ -397,7 +438,7 @@ export async function testMikrotikConnection(
         if (replyType === '!done') {
           // Autentikasi challenge berhasil! Lanjut baca identitas router
           currentStep = 'get_identity';
-          socket?.write(encodeSentence(['/system/identity/print']));
+          safeWrite(['/system/identity/print']);
           return;
         }
 
@@ -421,7 +462,7 @@ export async function testMikrotikConnection(
         } else if (replyType === '!done') {
           // Lanjut baca resource router (versi RouterOS, board-name, CPU load)
           currentStep = 'get_resource';
-          socket?.write(encodeSentence(['/system/resource/print']));
+          safeWrite(['/system/resource/print']);
           return;
         }
       }
@@ -447,8 +488,12 @@ export async function testMikrotikConnection(
           clearTimeout(timer);
 
           // Kirim /quit sebelum menutup soket dengan rapi
+          let sentQuit = false;
           try {
-            socket?.write(encodeSentence(['/quit']));
+            if (!isFinished && socket && !socket.destroyed && socket.writable) {
+              socket.write(encodeSentence(['/quit']));
+              sentQuit = true;
+            }
           } catch {
             // ignore
           }
@@ -456,11 +501,14 @@ export async function testMikrotikConnection(
           const routerIdDisplay = gatheredInfo.identity || cleanHost;
           const rosVerDisplay = gatheredInfo.version ? ` (RouterOS ${gatheredInfo.version})` : '';
 
-          finish({
-            success: true,
-            message: `Koneksi RouterOS API berhasil! Terhubung ke ${routerIdDisplay}${rosVerDisplay}. Autentikasi terverifikasi.`,
-            data: gatheredInfo as MikrotikSystemInfo,
-          });
+          finish(
+            {
+              success: true,
+              message: `Koneksi RouterOS API berhasil! Terhubung ke ${routerIdDisplay}${rosVerDisplay}. Autentikasi terverifikasi.`,
+              data: gatheredInfo as MikrotikSystemInfo,
+            },
+            sentQuit
+          );
         }
       }
     }
@@ -491,32 +539,66 @@ export async function withRouterOsClient<T>(
     let activeReplyReject: ((err: Error) => void) | null = null;
     let currentSentenceAccumulator: string[][] = [];
 
-    const cleanup = () => {
+    const cleanup = (graceful = false) => {
+      clearTimeout(timer);
       if (socket) {
+        const s = socket;
+        socket = null;
         try {
-          socket.removeAllListeners();
-          socket.destroy();
+          s.removeAllListeners('data');
+          s.removeAllListeners('timeout');
+          s.removeAllListeners('close');
+          s.removeAllListeners('end');
+          s.removeAllListeners('connect');
+          s.removeAllListeners('secureConnect');
+          s.removeAllListeners('error');
+          // Pasang error sink sebelum teardown agar event ECONNRESET/EPIPE asinkron saat teardown tidak unhandled
+          s.on('error', () => {
+            // ignore teardown error after settle
+          });
+          if (!s.destroyed) {
+            if (graceful && s.writable) {
+              const forceTimer = setTimeout(() => {
+                if (!s.destroyed) {
+                  try {
+                    s.destroy();
+                  } catch {
+                    // ignore
+                  }
+                }
+              }, 50);
+              forceTimer.unref();
+              s.once('close', () => clearTimeout(forceTimer));
+              s.end();
+            } else {
+              s.destroy();
+            }
+          }
         } catch {
           // ignore
         }
-        socket = null;
       }
     };
 
     const finishError = (err: Error) => {
       if (isFinished) return;
       isFinished = true;
-      cleanup();
+      cleanup(false);
       if (activeReplyReject) {
-        activeReplyReject(err);
+        const rejecter = activeReplyReject;
+        activeReplyResolve = null;
+        activeReplyReject = null;
+        rejecter(err);
       }
       reject(err);
     };
 
-    const finishSuccess = (res: T) => {
+    const finishSuccess = (res: T, graceful = false) => {
       if (isFinished) return;
       isFinished = true;
-      cleanup();
+      cleanup(graceful);
+      activeReplyResolve = null;
+      activeReplyReject = null;
       resolve(res);
     };
 
@@ -585,17 +667,25 @@ export async function withRouterOsClient<T>(
     type AuthStep = 'auth_init' | 'auth_challenge' | 'authenticated';
     let authStep: AuthStep = 'auth_init';
 
+    function safeClientWrite(sentenceToSend: string[]) {
+      if (!isFinished && socket && !socket.destroyed && socket.writable) {
+        socket.write(encodeSentence(sentenceToSend));
+      }
+    }
+
     function onConnected() {
       authStep = 'auth_init';
-      socket?.write(encodeSentence(['/login', `=name=${username}`, `=password=${password}`]));
+      safeClientWrite(['/login', `=name=${username}`, `=password=${password}`]);
     }
 
     socket.on('data', (chunk: Buffer) => {
+      if (isFinished) return;
       accumulatedBuffer = Buffer.concat([accumulatedBuffer, chunk]);
       const { sentences, remaining } = extractSentences(accumulatedBuffer);
       accumulatedBuffer = remaining;
 
       for (const sentence of sentences) {
+        if (isFinished) break;
         if (sentence.length === 0) continue;
 
         if (authStep !== 'authenticated') {
@@ -625,7 +715,7 @@ export async function withRouterOsClient<T>(
               .createHash('md5')
               .update(Buffer.concat([Buffer.from([0x00]), Buffer.from(password, 'utf8'), Buffer.from(challengeHex, 'hex')]))
               .digest('hex');
-            socket?.write(encodeSentence(['/login', `=name=${username}`, `=response=00${md5Hash}`]));
+            safeClientWrite(['/login', `=name=${username}`, `=response=00${md5Hash}`]);
             return;
           }
 
@@ -657,27 +747,40 @@ export async function withRouterOsClient<T>(
 
       const talk = (sentenceToSend: string[]): Promise<string[][]> => {
         return new Promise((res, rej) => {
+          if (isFinished || !socket || socket.destroyed || !socket.writable) {
+            return rej(new Error('Koneksi RouterOS sudah tertutup sebelum perintah dikirim.'));
+          }
           activeReplyResolve = res;
           activeReplyReject = rej;
           currentSentenceAccumulator = [];
-          socket?.write(encodeSentence(sentenceToSend));
+          try {
+            socket.write(encodeSentence(sentenceToSend));
+          } catch (writeErr: any) {
+            activeReplyResolve = null;
+            activeReplyReject = null;
+            rej(writeErr instanceof Error ? writeErr : new Error(String(writeErr)));
+          }
         });
       };
 
       action(talk)
         .then((result) => {
           clearTimeout(timer);
+          let sentQuit = false;
           try {
-            socket?.write(encodeSentence(['/quit']));
+            if (!isFinished && socket && !socket.destroyed && socket.writable) {
+              socket.write(encodeSentence(['/quit']));
+              sentQuit = true;
+            }
           } catch {
             // ignore
           }
-          finishSuccess(result);
+          finishSuccess(result, sentQuit);
         })
         .catch((err) => {
           clearTimeout(timer);
           try {
-            socket?.write(encodeSentence(['/quit']));
+            safeClientWrite(['/quit']);
           } catch {
             // ignore
           }

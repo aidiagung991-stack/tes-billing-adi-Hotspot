@@ -129,6 +129,8 @@ class MockRouterOsServer {
   server: net.Server;
   port = 0;
   offline = false;
+  private stopping = false;
+  private activeSockets = new Set<net.Socket>();
 
   pppoeProfiles = new Set<string>(['prof-pppoe-10m', 'prof-pppoe-20m']);
   hotspotProfiles = new Set<string>(['prof-hs-10m', 'prof-hs-20m']);
@@ -141,31 +143,108 @@ class MockRouterOsServer {
   commandLog: string[][] = [];
   trapOnCommand = new Map<string, string>(); // key: commandPath e.g. '/ppp/secret/set'
   fatalOnCommand = new Map<string, string>();
+  resetOnCommand = new Set<string>(); // simulasi abrupt TCP RST (ECONNRESET)
+  hangOnCommand = new Set<string>(); // simulasi server tidak membalas (timeout)
   failRemoveIds = new Set<string>(); // e.g. '*S2'
   lingerAfterRemoveIds = new Set<string>(); // remove succeeds in RouterOS reply but session persists on subsequent /print
   nextIdCounter = 100;
 
   constructor() {
     this.server = net.createServer((socket) => {
+      this.activeSockets.add(socket);
+      let socketClosing = false;
+      let quitReceived = false;
+      let fatalSent = false;
+
+      // Wajib pasang listener error paling awal sebelum operasi destroy()/write() apa pun
+      socket.on('error', (err: NodeJS.ErrnoException) => {
+        const code = err?.code || '';
+        if (
+          this.stopping ||
+          this.offline ||
+          socketClosing ||
+          quitReceived ||
+          fatalSent ||
+          code === 'ECONNRESET' ||
+          code === 'EPIPE' ||
+          code === 'ECONNABORTED' ||
+          code === 'ERR_STREAM_DESTROYED'
+        ) {
+          return;
+        }
+        console.error(`MockRouterOsServer unexpected socket error (${code}):`, err);
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
+      });
+
+      socket.on('end', () => {
+        socketClosing = true;
+      });
+
+      socket.on('close', () => {
+        socketClosing = true;
+        this.activeSockets.delete(socket);
+      });
+
       if (this.offline) {
+        socketClosing = true;
         socket.destroy();
         return;
       }
 
       let buf: Buffer = Buffer.alloc(0);
       socket.on('data', (chunk) => {
+        if (socketClosing || socket.destroyed) return;
         buf = Buffer.concat([buf, chunk]);
         const extracted = extractSentences(buf);
         buf = extracted.remaining;
 
         for (const words of extracted.sentences) {
-          this.handleSentence(socket, words);
+          if (socketClosing || socket.destroyed) break;
+          const outcome = this.handleSentence(socket, words);
+          if (outcome === 'quit') {
+            quitReceived = true;
+            socketClosing = true;
+            if (!socket.destroyed) {
+              socket.end();
+            }
+            break;
+          }
+          if (outcome === 'fatal') {
+            fatalSent = true;
+            socketClosing = true;
+            if (!socket.destroyed) {
+              socket.end();
+            }
+            break;
+          }
+          if (outcome === 'reset') {
+            socketClosing = true;
+            break;
+          }
         }
       });
     });
+
+    this.server.on('error', (err) => {
+      if (!this.stopping) {
+        console.error('MockRouterOsServer server error:', err);
+      }
+    });
+  }
+
+  private safeWrite(socket: net.Socket, words: string[]) {
+    if (socket.destroyed || !socket.writable) return;
+    try {
+      socket.write(encodeSentence(words));
+    } catch {
+      // Abaikan race condition penulisan saat peer menutup koneksi secara mendadak
+    }
   }
 
   async start(): Promise<number> {
+    this.stopping = false;
     await new Promise<void>((resolve) => {
       this.server.listen(0, '127.0.0.1', () => {
         const addr = this.server.address() as net.AddressInfo;
@@ -177,6 +256,15 @@ class MockRouterOsServer {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+    for (const sock of this.activeSockets) {
+      try {
+        if (!sock.destroyed) sock.destroy();
+      } catch {
+        // ignore
+      }
+    }
+    this.activeSockets.clear();
     await new Promise<void>((resolve) => {
       this.server.close(() => resolve());
     });
@@ -187,6 +275,8 @@ class MockRouterOsServer {
     this.commandLog = [];
     this.trapOnCommand.clear();
     this.fatalOnCommand.clear();
+    this.resetOnCommand.clear();
+    this.hangOnCommand.clear();
     this.failRemoveIds.clear();
     this.lingerAfterRemoveIds.clear();
     if (clearData) {
@@ -222,69 +312,93 @@ class MockRouterOsServer {
     return attrs;
   }
 
-  private handleSentence(socket: net.Socket, words: string[]) {
-    if (words.length === 0) return;
+  private handleSentence(socket: net.Socket, words: string[]): 'ok' | 'quit' | 'fatal' | 'reset' {
+    if (words.length === 0) return 'ok';
     const cmd = words[0];
     this.commandLog.push(words);
 
+    if (cmd === '/quit') {
+      return 'quit';
+    }
+
+    if (this.resetOnCommand.has(cmd)) {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+      return 'reset';
+    }
+
+    if (this.hangOnCommand.has(cmd)) {
+      return 'ok';
+    }
+
     if (this.fatalOnCommand.has(cmd)) {
       const msg = this.fatalOnCommand.get(cmd)!;
-      socket.write(encodeSentence(['!fatal', msg]));
-      socket.end();
-      return;
+      this.safeWrite(socket, ['!fatal', msg]);
+      return 'fatal';
     }
 
     if (this.trapOnCommand.has(cmd)) {
       const msg = this.trapOnCommand.get(cmd)!;
-      socket.write(encodeSentence(['!trap', `=message=${msg}`]));
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!trap', `=message=${msg}`]);
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     const attrs = this.parseAttrs(words);
 
     if (cmd === '/login') {
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
+    }
+
+    if (cmd === '/system/identity/print') {
+      this.safeWrite(socket, ['!re', '=name=MockRB4011']);
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
+    }
+
+    if (cmd === '/system/resource/print') {
+      this.safeWrite(socket, ['!re', '=version=7.14', '=board-name=RB4011iGS+', '=cpu-load=5']);
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ppp/profile/print') {
       const filterName = attrs['?name'];
       const names = [...this.pppoeProfiles].filter((n) => (filterName !== undefined ? n === filterName : true));
       for (const n of names) {
-        socket.write(encodeSentence(['!re', `=name=${n}`]));
+        this.safeWrite(socket, ['!re', `=name=${n}`]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/user/profile/print') {
       const filterName = attrs['?name'];
       const names = [...this.hotspotProfiles].filter((n) => (filterName !== undefined ? n === filterName : true));
       for (const n of names) {
-        socket.write(encodeSentence(['!re', `=name=${n}`]));
+        this.safeWrite(socket, ['!re', `=name=${n}`]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ppp/secret/print') {
       const filterName = attrs['?name'];
       const matches = this.pppoeSecrets.filter((s) => (filterName !== undefined ? s.name === filterName : true));
       for (const s of matches) {
-        socket.write(
-          encodeSentence([
-            '!re',
-            `=.id=${s['.id']}`,
-            `=name=${s.name}`,
-            `=password=${s.password}`,
-            `=profile=${s.profile}`,
-            `=disabled=${s.disabled}`,
-          ])
-        );
+        this.safeWrite(socket, [
+          '!re',
+          `=.id=${s['.id']}`,
+          `=name=${s.name}`,
+          `=password=${s.password}`,
+          `=profile=${s.profile}`,
+          `=disabled=${s.disabled}`,
+        ]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ppp/secret/add') {
@@ -297,59 +411,57 @@ class MockRouterOsServer {
         ...(attrs['remote-address'] ? { 'remote-address': attrs['remote-address'] } : {}),
       };
       this.pppoeSecrets.push(newSecret);
-      socket.write(encodeSentence(['!done', `=ret=${newSecret['.id']}`]));
-      return;
+      this.safeWrite(socket, ['!done', `=ret=${newSecret['.id']}`]);
+      return 'ok';
     }
 
     if (cmd === '/ppp/secret/set') {
       const id = attrs['.id'];
       const found = this.pppoeSecrets.find((s) => s['.id'] === id);
       if (!found) {
-        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
-        socket.write(encodeSentence(['!done']));
-        return;
+        this.safeWrite(socket, ['!trap', `=message=no such item (${id})`]);
+        this.safeWrite(socket, ['!done']);
+        return 'ok';
       }
       if (attrs.password !== undefined) found.password = attrs.password;
       if (attrs.profile !== undefined) found.profile = attrs.profile;
       if (attrs.disabled !== undefined) found.disabled = attrs.disabled === 'yes' ? 'true' : 'false';
       if (attrs['remote-address'] !== undefined) found['remote-address'] = attrs['remote-address'];
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ppp/secret/remove') {
       const id = attrs['.id'];
       if (this.failRemoveIds.has(id)) {
-        socket.write(encodeSentence(['!trap', `=message=injected failure removing secret ${id}`]));
-        socket.write(encodeSentence(['!done']));
-        return;
+        this.safeWrite(socket, ['!trap', `=message=injected failure removing secret ${id}`]);
+        this.safeWrite(socket, ['!done']);
+        return 'ok';
       }
       const before = this.pppoeSecrets.length;
       this.pppoeSecrets = this.pppoeSecrets.filter((s) => s['.id'] !== id);
       if (this.pppoeSecrets.length === before) {
-        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
+        this.safeWrite(socket, ['!trap', `=message=no such item (${id})`]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/user/print') {
       const filterName = attrs['?name'];
       const matches = this.hotspotUsers.filter((s) => (filterName !== undefined ? s.name === filterName : true));
       for (const s of matches) {
-        socket.write(
-          encodeSentence([
-            '!re',
-            `=.id=${s['.id']}`,
-            `=name=${s.name}`,
-            `=password=${s.password}`,
-            `=profile=${s.profile}`,
-            `=disabled=${s.disabled}`,
-          ])
-        );
+        this.safeWrite(socket, [
+          '!re',
+          `=.id=${s['.id']}`,
+          `=name=${s.name}`,
+          `=password=${s.password}`,
+          `=profile=${s.profile}`,
+          `=disabled=${s.disabled}`,
+        ]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/user/add') {
@@ -361,90 +473,91 @@ class MockRouterOsServer {
         disabled: attrs.disabled === 'yes' ? 'true' : 'false',
       };
       this.hotspotUsers.push(newUser);
-      socket.write(encodeSentence(['!done', `=ret=${newUser['.id']}`]));
-      return;
+      this.safeWrite(socket, ['!done', `=ret=${newUser['.id']}`]);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/user/set') {
       const id = attrs['.id'];
       const found = this.hotspotUsers.find((s) => s['.id'] === id);
       if (!found) {
-        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
-        socket.write(encodeSentence(['!done']));
-        return;
+        this.safeWrite(socket, ['!trap', `=message=no such item (${id})`]);
+        this.safeWrite(socket, ['!done']);
+        return 'ok';
       }
       if (attrs.password !== undefined) found.password = attrs.password;
       if (attrs.profile !== undefined) found.profile = attrs.profile;
       if (attrs.disabled !== undefined) found.disabled = attrs.disabled === 'yes' ? 'true' : 'false';
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/user/remove') {
       const id = attrs['.id'];
       if (this.failRemoveIds.has(id)) {
-        socket.write(encodeSentence(['!trap', `=message=injected failure removing hotspot user ${id}`]));
-        socket.write(encodeSentence(['!done']));
-        return;
+        this.safeWrite(socket, ['!trap', `=message=injected failure removing hotspot user ${id}`]);
+        this.safeWrite(socket, ['!done']);
+        return 'ok';
       }
       const before = this.hotspotUsers.length;
       this.hotspotUsers = this.hotspotUsers.filter((s) => s['.id'] !== id);
       if (this.hotspotUsers.length === before) {
-        socket.write(encodeSentence(['!trap', `=message=no such item (${id})`]));
+        this.safeWrite(socket, ['!trap', `=message=no such item (${id})`]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ppp/active/print') {
       const filterName = attrs['?name'];
       const matches = this.pppoeActives.filter((a) => (filterName !== undefined ? a.name === filterName : true));
       for (const a of matches) {
-        socket.write(encodeSentence(['!re', `=.id=${a['.id']}`, `=name=${a.name || ''}`, `=address=${a.address || '10.0.0.2'}`]));
+        this.safeWrite(socket, ['!re', `=.id=${a['.id']}`, `=name=${a.name || ''}`, `=address=${a.address || '10.0.0.2'}`]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ppp/active/remove') {
       const id = attrs['.id'];
       if (this.failRemoveIds.has(id)) {
-        socket.write(encodeSentence(['!trap', `=message=injected failure removing ppp active ${id}`]));
-        socket.write(encodeSentence(['!done']));
-        return;
+        this.safeWrite(socket, ['!trap', `=message=injected failure removing ppp active ${id}`]);
+        this.safeWrite(socket, ['!done']);
+        return 'ok';
       }
       if (!this.lingerAfterRemoveIds.has(id)) {
         this.pppoeActives = this.pppoeActives.filter((a) => a['.id'] !== id);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/active/print') {
       const filterUser = attrs['?user'];
       const matches = this.hotspotActives.filter((a) => (filterUser !== undefined ? a.user === filterUser : true));
       for (const a of matches) {
-        socket.write(encodeSentence(['!re', `=.id=${a['.id']}`, `=user=${a.user || ''}`, `=address=${a.address || '10.5.50.2'}`]));
+        this.safeWrite(socket, ['!re', `=.id=${a['.id']}`, `=user=${a.user || ''}`, `=address=${a.address || '10.5.50.2'}`]);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
     if (cmd === '/ip/hotspot/active/remove') {
       const id = attrs['.id'];
       if (this.failRemoveIds.has(id)) {
-        socket.write(encodeSentence(['!trap', `=message=injected failure removing hotspot active ${id}`]));
-        socket.write(encodeSentence(['!done']));
-        return;
+        this.safeWrite(socket, ['!trap', `=message=injected failure removing hotspot active ${id}`]);
+        this.safeWrite(socket, ['!done']);
+        return 'ok';
       }
       if (!this.lingerAfterRemoveIds.has(id)) {
         this.hotspotActives = this.hotspotActives.filter((a) => a['.id'] !== id);
       }
-      socket.write(encodeSentence(['!done']));
-      return;
+      this.safeWrite(socket, ['!done']);
+      return 'ok';
     }
 
-    socket.write(encodeSentence(['!done']));
+    this.safeWrite(socket, ['!done']);
+    return 'ok';
   }
 }
 
@@ -686,6 +799,7 @@ async function main() {
 
   const { encryptMikrotikPassword } = await import('../cryptoUtils.js');
   const {
+    testMikrotikConnection,
     disconnectPppoeSession,
     disconnectHotspotSession,
     createOrUpdatePppoeSecret,
@@ -1656,6 +1770,55 @@ async function main() {
     assert.equal(parsedTrunc.corrupted, true);
     assert.equal(parsedTrunc.needsSessionDisconnect, true);
     assert.deepEqual(parsedTrunc.oldAccounts, [{ type: 'pppoe', username: 'legacy_trunc' }]);
+  });
+
+  // Skenario 30: Ketahanan socket lifecycle (/quit bersih, offline, !fatal, mid-command ECONNRESET, dan timeout) tanpa unhandled error
+  await runScenario(30, 'Ketahanan socket lifecycle: /quit, offline, !fatal, mid-command TCP reset (ECONNRESET), dan timeout tertangani bersih', async () => {
+    const connOpts = {
+      host: '127.0.0.1',
+      port: routerPort,
+      username: 'admin',
+      password: 'router_secret_123',
+      timeoutSeconds: 3,
+    };
+
+    // 30a: testMikrotikConnection sukses + kirim /quit
+    const okConn = await testMikrotikConnection(connOpts);
+    assert.equal(okConn.success, true);
+    assert.equal(okConn.data?.identity, 'MockRB4011');
+    await new Promise((r) => setTimeout(r, 25));
+    assert.ok(mockRouter.commandLog.some((cmd) => cmd[0] === '/quit'));
+
+    // 30b: testMikrotikConnection saat router offline (mock melakukan socket.destroy())
+    mockRouter.offline = true;
+    const offConn = await testMikrotikConnection(connOpts);
+    assert.equal(offConn.success, false);
+    mockRouter.offline = false;
+
+    // 30c: Mid-command abrupt TCP RST (ECONNRESET) saat /ppp/secret/add -> gagal terkendali tanpa crash
+    mockRouter.resetOnCommand.add('/ppp/secret/add');
+    const rstRes = await api('POST', '/customers', {
+      id: 'c-30',
+      name: 'Socket Reset Test',
+      phone: '0830',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'reset30',
+      password: 'Password30',
+      status: 'active',
+    });
+    assert.equal(rstRes.status, 200);
+    assert.equal(rstRes.json.data.routerSyncStatus, 'failed');
+    assertNoPlaintextLeak(rstRes.rawText, dbStore.customers.get('c-30'), 'Password30');
+    mockRouter.resetOnCommand.clear();
+
+    // 30d: Timeout saat server tidak membalas /system/identity/print (socket.destroy() + timer cleanup)
+    mockRouter.hangOnCommand.add('/system/identity/print');
+    const timeoutConn = await testMikrotikConnection(connOpts);
+    assert.equal(timeoutConn.success, false);
+    assert.equal(timeoutConn.errorDetails, 'ETIMEDOUT');
+    mockRouter.hangOnCommand.clear();
   });
 
   // Restore prototypes & stop servers cleanly
