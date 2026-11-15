@@ -141,6 +141,7 @@ class MockRouterOsServer {
   hotspotActives: MockRouterSession[] = [];
 
   commandLog: string[][] = [];
+  connectionCount = 0;
   trapOnCommand = new Map<string, string>(); // key: commandPath e.g. '/ppp/secret/set'
   fatalOnCommand = new Map<string, string>();
   resetOnCommand = new Set<string>(); // simulasi abrupt TCP RST (ECONNRESET)
@@ -151,6 +152,7 @@ class MockRouterOsServer {
 
   constructor() {
     this.server = net.createServer((socket) => {
+      this.connectionCount++;
       this.activeSockets.add(socket);
       let socketClosing = false;
       let quitReceived = false;
@@ -865,6 +867,7 @@ async function main() {
     ALLOWED_ERROR_CODES,
     ALLOWED_SOCKET_ERROR_CODES,
     FATAL_ERROR_CODES,
+    MAX_SYNC_META_V1_OLD_ACCOUNTS,
     SafeOperationalError,
     isFatalMikrotikError,
     parseSyncMetaV1Payload,
@@ -876,7 +879,15 @@ async function main() {
     logSafeServerError,
   } = await import('../errorSanitizer.js');
   const dbRoutesModule = await import('../dbRoutes.js');
-  const { parsePendingSyncActions, sanitizeMikrotikOperationMessage, createDbRouter } = dbRoutesModule;
+  const {
+    parsePendingSyncActions,
+    mergeOldAccounts,
+    appendPendingMarkers,
+    sanitizeMikrotikOperationMessage,
+    sanitizeSyncMessagePreservingMeta,
+    stripPendingMarkersFromMessage,
+    createDbRouter,
+  } = dbRoutesModule;
 
   const routerPasswordEnc = encryptMikrotikPassword('router_secret_123');
   dbStore.reset(routerPort, routerPasswordEnc);
@@ -1823,24 +1834,21 @@ async function main() {
     assert.equal(parsed.oldAccounts.length, 0);
   });
 
-  // Skenario 29: Metadata SYNC_META_V1 rusak/tidak valid sementara pesan mengandung penanda legacy -> fallback aman & pending action tetap terjaga
-  await runScenario(29, 'Metadata SYNC_META_V1 rusak dengan penanda legacy menggunakan fallback aman tanpa menghilangkan pending action', async () => {
+  // Skenario 29: Metadata SYNC_META_V1 rusak bercampur penanda legacy -> FAIL-CLOSED (tidak menjalankan fallback legacy oldAccounts)
+  await runScenario(29, 'Metadata SYNC_META_V1 rusak dengan penanda legacy bersifat fail-closed (corrupted=true, oldAccounts kosong)', async () => {
     const badBase64Msg =
       'Gagal sinkronisasi [SYNC_META_V1:broken!@#invalid] [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:legacy_old1,hotspot:legacy_old2]';
     const parsedBadB64 = parsePendingSyncActions('failed', badBase64Msg);
     assert.equal(parsedBadB64.corrupted, true);
     assert.equal(parsedBadB64.needsSessionDisconnect, true);
-    assert.deepEqual(parsedBadB64.oldAccounts, [
-      { type: 'pppoe', username: 'legacy_old1' },
-      { type: 'hotspot', username: 'legacy_old2' },
-    ]);
+    assert.deepEqual(parsedBadB64.oldAccounts, []);
 
     const truncatedV1Msg =
       'Gagal terpotong [SYNC_META_V1:eyJ2Ijox [Perlu pembersihan akun lama: pppoe:legacy_trunc]';
     const parsedTrunc = parsePendingSyncActions('failed', truncatedV1Msg);
     assert.equal(parsedTrunc.corrupted, true);
     assert.equal(parsedTrunc.needsSessionDisconnect, true);
-    assert.deepEqual(parsedTrunc.oldAccounts, [{ type: 'pppoe', username: 'legacy_trunc' }]);
+    assert.deepEqual(parsedTrunc.oldAccounts, []);
   });
 
   // Skenario 30: Ketahanan socket lifecycle (/quit bersih, offline, !fatal, mid-command ECONNRESET, dan timeout) tanpa unhandled error
@@ -3013,6 +3021,433 @@ async function main() {
     assert.equal(parsedSafe48.corrupted, false);
     assert.equal(parsedSafe48.needsSessionDisconnect, true);
     assert.deepEqual(parsedSafe48.oldAccounts, [{ type: 'pppoe', username: 'pelanggan_01' }]);
+  });
+
+  // Skenario 49: Pengujian fail-closed parser & sanitizer SYNC_META_V1 + verifikasi endpoint HTTP 422 & 0 perintah MikroTik
+  await runScenario(49, 'Keamanan Fail-Closed SYNC_META_V1: 10 kasus penanda terpotong/ganda/campuran, sanitasi aman, HTTP 422 retry, & 0 perintah MikroTik pada seluruh jalur', async () => {
+    const toB64 = (obj: unknown) => Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
+    const b64Valid1 = toB64({
+      v: 1,
+      needsSessionDisconnect: false,
+      oldAccounts: [{ type: 'pppoe', username: 'old_acc_1' }],
+      stages: { accountProvisioned: true, accountVerified: true, oldAccountsPending: 1, sessionDisconnectPending: false },
+    });
+    const b64Valid2 = toB64({
+      v: 1,
+      needsSessionDisconnect: true,
+      oldAccounts: [{ type: 'hotspot', username: 'old_acc_2' }],
+      stages: { sessionDisconnectPending: true },
+    });
+    const validTag1 = `[SYNC_META_V1:${b64Valid1}]`;
+    const validTag2 = `[SYNC_META_V1:${b64Valid2}]`;
+    const truncatedPayload = 'eyJ2IjoxLCJuZWVkc1Nlc3Npb25EaXNjb25uZWN0IjpmYWxzZQ_TRUNCATED';
+    const truncatedTag = `[SYNC_META_V1:${truncatedPayload}`;
+    const invalidPayloadTag = '[SYNC_META_V1:not_valid_base64!!]';
+
+    // 1. Satu penanda V1 valid saja
+    const case1 = parsePendingSyncActions('failed', `Gagal ${validTag1}`);
+    assert.equal(case1.corrupted, false);
+    assert.equal(case1.needsSessionDisconnect, false);
+    assert.deepEqual(case1.oldAccounts, [{ type: 'pppoe', username: 'old_acc_1' }]);
+
+    // 2. Satu penanda V1 tidak lengkap saja
+    const case2 = parsePendingSyncActions('failed', `Gagal ${truncatedTag}`);
+    assert.equal(case2.corrupted, true);
+    assert.equal(case2.needsSessionDisconnect, true);
+    assert.deepEqual(case2.oldAccounts, []);
+
+    // 3. Satu penanda V1 valid diikuti satu penanda V1 terpotong
+    const case3 = parsePendingSyncActions('failed', `Gagal ${validTag1}\n${truncatedTag}`);
+    assert.equal(case3.corrupted, true, 'Penanda valid + terpotong wajib fail-closed');
+    assert.equal(case3.needsSessionDisconnect, true);
+    assert.deepEqual(case3.oldAccounts, [], 'Tidak boleh mengambil oldAccounts sebagian dari penanda valid pertama');
+
+    // 4. Satu penanda V1 terpotong diikuti satu penanda V1 valid
+    const case4 = parsePendingSyncActions('failed', `Gagal ${truncatedTag} ${validTag1}`);
+    assert.equal(case4.corrupted, true, 'Penanda terpotong + valid wajib fail-closed');
+    assert.equal(case4.needsSessionDisconnect, true);
+    assert.deepEqual(case4.oldAccounts, [], 'Tidak boleh mengambil oldAccounts sebagian dari penanda valid kedua');
+
+    // 5. Dua penanda V1 valid
+    const case5 = parsePendingSyncActions('failed', `Gagal ${validTag1} ${validTag2}`);
+    assert.equal(case5.corrupted, false);
+    assert.equal(case5.needsSessionDisconnect, true);
+    assert.deepEqual(case5.oldAccounts, [
+      { type: 'pppoe', username: 'old_acc_1' },
+      { type: 'hotspot', username: 'old_acc_2' },
+    ]);
+
+    // 6. Dua penanda V1 valid ditambah satu penanda terpotong
+    const case6 = parsePendingSyncActions('failed', `Gagal ${validTag1} ${validTag2} ${truncatedTag}`);
+    assert.equal(case6.corrupted, true);
+    assert.deepEqual(case6.oldAccounts, []);
+
+    // 7. Penanda V1 dengan payload tidak valid
+    const case7 = parsePendingSyncActions('failed', `Gagal ${invalidPayloadTag}`);
+    assert.equal(case7.corrupted, true);
+    assert.deepEqual(case7.oldAccounts, []);
+
+    // 8. Penanda V1 rusak bercampur dengan penanda legacy
+    const case8 = parsePendingSyncActions(
+      'failed',
+      `Gagal ${validTag1} ${truncatedTag} [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:legacy_must_ignore]`
+    );
+    assert.equal(case8.corrupted, true);
+    assert.deepEqual(case8.oldAccounts, [], 'Fallback legacy dilarang dijalankan ketika penanda V1 ditemukan tetapi rusak');
+
+    // 9. Penanda legacy valid tanpa penanda V1 tetap kompatibel
+    const case9 = parsePendingSyncActions(
+      'failed',
+      'Gagal sinkronisasi [Perlu ulang pemutusan sesi] [Perlu pembersihan akun lama: pppoe:leg1,hotspot:leg2]'
+    );
+    assert.equal(case9.corrupted, false);
+    assert.equal(case9.needsSessionDisconnect, true);
+    assert.deepEqual(case9.oldAccounts, [
+      { type: 'pppoe', username: 'leg1' },
+      { type: 'hotspot', username: 'leg2' },
+    ]);
+
+    // 10. Sanitasi pesan yang berisi penanda V1 terpotong tidak membocorkan payload mentah
+    const dirtySamples = [
+      `Gagal koneksi ${truncatedTag}`,
+      `Gagal koneksi ${validTag1} ${truncatedTag}`,
+      `Gagal koneksi ${truncatedTag} ${validTag1}`,
+      `Gagal koneksi [SYNC_META_V2:${truncatedPayload}`,
+    ];
+    for (const sample of dirtySamples) {
+      const red = redactSensitiveText(sample);
+      const preserved = sanitizeSyncMessagePreservingMeta(sample);
+      const stripped = stripPendingMarkersFromMessage(sample);
+      for (const output of [red, preserved, stripped]) {
+        assert.ok(!output.includes(truncatedPayload), `Payload terpotong tidak boleh bocor: ${output}`);
+        assert.ok(!output.includes(b64Valid1), `Metadata parsial tidak boleh dipertahankan ketika ada penanda rusak: ${output}`);
+        assert.ok(!output.includes('[SYNC_META_V1:'), `Prefix V1 rusak tidak boleh bocor: ${output}`);
+        assert.ok(!output.includes('[SYNC_META_V2:'), `Prefix V2 rusak tidak boleh bocor: ${output}`);
+      }
+      assert.ok(red.includes('[INVALID_SYNC_META]'), `redactSensitiveText harus menandai [INVALID_SYNC_META]: ${red}`);
+      assert.ok(preserved.includes('[INVALID_SYNC_META]'), `sanitizeSyncMessagePreservingMeta harus menandai [INVALID_SYNC_META]: ${preserved}`);
+      assert.equal(stripped, 'Gagal koneksi');
+    }
+    // Pastikan teks biasa & penanda V1 valid tetap dipertahankan
+    assert.equal(redactSensitiveText(`Info aman ${validTag1}`), `Info aman ${validTag1}`);
+    assert.equal(sanitizeSyncMessagePreservingMeta(`Info aman ${validTag1}`), `Info aman ${validTag1}`);
+
+    // Pengujian endpoint end-to-end dengan mock MikroTik:
+    // Pastikan saat metadata V1 valid + terpotong tersimpan di DB:
+    // - POST /sync-router mengembalikan HTTP 422, 0 koneksi & 0 perintah RouterOS, status tetap failed, & pesan aman
+    // - PUT /customers/:id (ganti paket/username/tipe) & PATCH /customers/:id/status TIDAK menjalankan koneksi/perintah RouterOS & status tetap failed
+    // - GET /customers tidak membocorkan payload terpotong
+    await api('POST', '/customers', {
+      id: 'c-sec-49',
+      name: 'Audit Fail Closed 49',
+      phone: '084900',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec49_user',
+      password: 'CustomerSecret49',
+      status: 'active',
+    });
+    const row49 = dbStore.customers.get('c-sec-49')!;
+    row49.router_sync_status = 'failed';
+    row49.router_last_sync_message =
+      `Gagal sebelumnya password=CustomerSecret49 token=Tok49 enc:v1:aa:bb SELECT * FROM users ${validTag1} ${truncatedTag} [Perlu pembersihan akun lama: pppoe:sec49_legacy_should_not_run]`;
+
+    // Cek GET /customers aman
+    const listRes = await api('GET', '/customers');
+    assert.equal(listRes.status, 200);
+    const listed49 = listRes.json.data.find((c: any) => c.id === 'c-sec-49');
+    assert.ok(listed49);
+    for (const forbidden of ['CustomerSecret49', 'Tok49', 'enc:v1:', 'SELECT * FROM', truncatedPayload]) {
+      assert.ok(!String(listed49.routerLastSyncMessage).includes(forbidden), `GET /customers membocorkan ${forbidden}`);
+    }
+    assert.ok(String(listed49.routerLastSyncMessage).includes('[INVALID_SYNC_META]'));
+
+    // Cek POST /customers/c-sec-49/sync-router -> HTTP 422 & 0 koneksi/perintah RouterOS
+    mockRouter.commandLog = [];
+    const connBeforeSync = mockRouter.connectionCount;
+    const retry49 = await api('POST', '/customers/c-sec-49/sync-router');
+    assert.equal(retry49.status, 422);
+    assert.equal(retry49.json.success, false);
+    assert.equal(retry49.json.data.routerSyncStatus, 'failed');
+    assert.equal(dbStore.customers.get('c-sec-49')?.router_sync_status, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforeSync, 'POST sync-router tidak boleh membuka koneksi MikroTik saat metadata rusak');
+    assert.equal(mockRouter.commandLog.length, 0, 'POST sync-router tidak boleh menjalankan perintah MikroTik saat metadata rusak');
+    assert.equal(decodeV1Meta(retry49.json.data.routerLastSyncMessage).corrupted, true);
+    assert.deepEqual(decodeV1Meta(retry49.json.data.routerLastSyncMessage).oldAccounts, []);
+    for (const forbidden of ['CustomerSecret49', 'Tok49', 'router_secret_123', 'enc:v1:', 'SELECT ', 'password_encrypted', truncatedPayload]) {
+      assert.ok(!String(retry49.json.message).includes(forbidden));
+    }
+
+    // Kembalikan ke state korup awal lalu uji PUT /customers/:id (ubah paket & username) -> 0 koneksi/perintah RouterOS & tetap failed
+    row49.router_sync_status = 'failed';
+    row49.router_last_sync_message = `Gagal sebelumnya ${validTag1} ${truncatedTag}`;
+    mockRouter.commandLog = [];
+    const connBeforePut = mockRouter.connectionCount;
+    const put49 = await api('PUT', '/customers/c-sec-49', {
+      packageId: 'pkg-20m',
+      packageName: 'Paket 20 Mbps',
+      username: 'sec49_renamed',
+      type: 'hotspot',
+    });
+    assert.equal(put49.status, 200);
+    assert.equal(put49.json.data.routerSyncStatus, 'failed');
+    assert.equal(dbStore.customers.get('c-sec-49')?.router_sync_status, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforePut, 'PUT /customers/:id tidak boleh membuka koneksi MikroTik saat metadata rusak');
+    assert.equal(mockRouter.commandLog.length, 0, 'PUT /customers/:id tidak boleh menjalankan perintah MikroTik saat metadata rusak');
+    assert.equal(decodeV1Meta(put49.json.data.routerLastSyncMessage).corrupted, true);
+
+    // Uji PATCH /customers/:id/status -> 0 koneksi/perintah RouterOS & tetap failed
+    mockRouter.commandLog = [];
+    const connBeforePatch = mockRouter.connectionCount;
+    const patch49 = await api('PATCH', '/customers/c-sec-49/status', { status: 'isolated' });
+    assert.equal(patch49.status, 200);
+    assert.equal(patch49.json.data.routerSyncStatus, 'failed');
+    assert.equal(dbStore.customers.get('c-sec-49')?.router_sync_status, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforePatch, 'PATCH /customers/:id/status tidak boleh membuka koneksi MikroTik saat metadata rusak');
+    assert.equal(mockRouter.commandLog.length, 0, 'PATCH /customers/:id/status tidak boleh menjalankan perintah MikroTik saat metadata rusak');
+    assert.equal(decodeV1Meta(patch49.json.data.routerLastSyncMessage).corrupted, true);
+
+    // Setelah PUT/PATCH yang mempertahankan status failed + corrupted:true, POST /sync-router tetap menolak HTTP 422 & 0 koneksi/perintah RouterOS
+    mockRouter.commandLog = [];
+    const connBeforeRetry2 = mockRouter.connectionCount;
+    const retryAfterPut49 = await api('POST', '/customers/c-sec-49/sync-router');
+    assert.equal(retryAfterPut49.status, 422);
+    assert.equal(retryAfterPut49.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforeRetry2);
+    assert.equal(mockRouter.commandLog.length, 0);
+  });
+
+  // Skenario 50: Batas MAX_SYNC_META_V1_OLD_ACCOUNTS & fail-closed pada jalur metadata legacy
+  await runScenario(50, 'Batas MAX_SYNC_META_V1_OLD_ACCOUNTS pada jalur legacy & pencegahan cleanup parsial saat rusak/melebihi batas', async () => {
+    const exactLimitEntries = Array.from(
+      { length: MAX_SYNC_META_V1_OLD_ACCOUNTS },
+      (_, idx) => `${idx % 2 === 0 ? 'pppoe' : 'hotspot'}:leg_limit_${idx + 1}`
+    );
+    const overLimitEntries = [...exactLimitEntries, 'pppoe:leg_limit_overflow'];
+
+    // 1. Legacy dengan jumlah akun tepat pada batas -> valid & semua akun terbaca
+    const exactLegacyMsg = `Gagal lama [Perlu pembersihan akun lama: ${exactLimitEntries.join(',')}]`;
+    const parsedExact = parsePendingSyncActions('failed', exactLegacyMsg);
+    assert.equal(parsedExact.corrupted, false);
+    assert.equal(parsedExact.oldAccounts.length, MAX_SYNC_META_V1_OLD_ACCOUNTS);
+    assert.equal(parsedExact.oldAccounts[0].username, 'leg_limit_1');
+    assert.equal(parsedExact.oldAccounts[MAX_SYNC_META_V1_OLD_ACCOUNTS - 1].username, `leg_limit_${MAX_SYNC_META_V1_OLD_ACCOUNTS}`);
+
+    // 2. Legacy dengan jumlah akun melebihi batas -> corrupted=true, needsSessionDisconnect=true, oldAccounts=[]
+    const overLegacyMsg = `Gagal lama [Perlu pembersihan akun lama: ${overLimitEntries.join(',')}]`;
+    const parsedOver = parsePendingSyncActions('failed', overLegacyMsg);
+    assert.equal(parsedOver.corrupted, true);
+    assert.equal(parsedOver.needsSessionDisconnect, true);
+    assert.deepEqual(parsedOver.oldAccounts, []);
+    assert.ok(parsedOver.corruptedReason && parsedOver.corruptedReason.length > 0);
+
+    // 3. Beberapa blok legacy yang jika digabung melebihi batas (6 + 5 = 11 > 10) -> corrupted=true, oldAccounts=[]
+    const blockA = Array.from({ length: 6 }, (_, i) => `pppoe:blk_a_${i + 1}`).join(',');
+    const blockB = Array.from({ length: 5 }, (_, i) => `hotspot:blk_b_${i + 1}`).join(',');
+    const combinedOverMsg = `Gagal [Perlu pembersihan akun lama: ${blockA}] dan [Perlu pembersihan akun lama: ${blockB}]`;
+    const parsedCombinedOver = parsePendingSyncActions('failed', combinedOverMsg);
+    assert.equal(parsedCombinedOver.corrupted, true);
+    assert.equal(parsedCombinedOver.needsSessionDisconnect, true);
+    assert.deepEqual(parsedCombinedOver.oldAccounts, []);
+
+    // 4. Metadata legacy rusak (entri tidak valid / blok kedua terpotong) -> TIDAK boleh menghasilkan cleanup parsial
+    const partialMalformedMsg =
+      'Gagal [Perlu pembersihan akun lama: pppoe:valid_before_bad,entri_rusak_tanpa_prefix]';
+    const parsedPartialMalformed = parsePendingSyncActions('failed', partialMalformedMsg);
+    assert.equal(parsedPartialMalformed.corrupted, true);
+    assert.equal(parsedPartialMalformed.needsSessionDisconnect, true);
+    assert.deepEqual(parsedPartialMalformed.oldAccounts, []);
+
+    const partialTruncatedLegacyMsg =
+      'Gagal [Perlu pembersihan akun lama: pppoe:valid_first] [Perlu pembersihan akun lama: pppoe:trunc_second';
+    const parsedPartialTruncated = parsePendingSyncActions('failed', partialTruncatedLegacyMsg);
+    assert.equal(parsedPartialTruncated.corrupted, true);
+    assert.equal(parsedPartialTruncated.needsSessionDisconnect, true);
+    assert.deepEqual(parsedPartialTruncated.oldAccounts, []);
+
+    // Verifikasi end-to-end: saat legacy melebihi batas / rusak, sync-router menolak HTTP 422 & TIDAK menjalankan cleanup parsial pada router
+    await api('POST', '/customers', {
+      id: 'c-sec-50',
+      name: 'Audit Legacy Limit 50',
+      phone: '085000',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec50_user',
+      password: 'CustomerSecret50',
+      status: 'active',
+    });
+    mockRouter.pppoeSecrets.push({
+      '.id': '*LEG_50_1',
+      name: 'leg_limit_1',
+      password: 'Old',
+      profile: 'prof-pppoe-10m',
+      disabled: 'false',
+    });
+    const row50 = dbStore.customers.get('c-sec-50')!;
+    row50.router_sync_status = 'failed';
+    row50.router_last_sync_message = overLegacyMsg;
+
+    mockRouter.commandLog = [];
+    const connBefore50 = mockRouter.connectionCount;
+    const retry50 = await api('POST', '/customers/c-sec-50/sync-router');
+    assert.equal(retry50.status, 422);
+    assert.equal(retry50.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.connectionCount, connBefore50);
+    assert.equal(mockRouter.commandLog.length, 0);
+    assert.equal(
+      mockRouter.pppoeSecrets.some((s) => s.name === 'leg_limit_1'),
+      true,
+      'Akun lama pada metadata legacy yang melebihi batas tidak boleh dihapus sebagian!'
+    );
+  });
+
+  // Skenario 51: Audit & perbaikan overflow mergeOldAccounts() & fail-closed pra-merge
+  await runScenario(51, 'Overflow mergeOldAccounts (>10), deduplikasi, persistensi billing, dan 0 perintah RouterOS saat overflow/corrupted', async () => {
+    const tenUnique = Array.from({ length: MAX_SYNC_META_V1_OLD_ACCOUNTS }, (_, idx) => ({
+      type: (idx % 2 === 0 ? 'pppoe' : 'hotspot') as 'pppoe' | 'hotspot',
+      username: `old_u_${idx + 1}`,
+    }));
+
+    // 1. Tepat 10 akun unik diterima tanpa overflow
+    const exact10Res = mergeOldAccounts([tenUnique], { type: 'pppoe', username: 'active_user_51' });
+    assert.equal(exact10Res.overflow, false);
+    assert.equal(exact10Res.totalUniqueCount, 10);
+    assert.equal(exact10Res.accounts.length, 10);
+
+    // 2. Duplikat tidak dihitung dua kali (10 unik + duplikat di list1 & list2 + excludeCurrent) -> tetap 10, overflow=false
+    const dupRes = mergeOldAccounts(
+      [
+        tenUnique,
+        [
+          { type: 'pppoe', username: ' old_u_1 ' },
+          { type: 'hotspot', username: 'old_u_2' },
+          { type: 'pppoe', username: 'active_user_51' },
+        ],
+      ],
+      { type: 'pppoe', username: 'active_user_51' }
+    );
+    assert.equal(dupRes.overflow, false);
+    assert.equal(dupRes.totalUniqueCount, 10);
+    assert.equal(dupRes.accounts.length, 10);
+
+    // 3. 11 akun unik memicu overflow eksplisit dan TIDAK memotong menjadi 10
+    const elevenUnique = [...tenUnique, { type: 'pppoe' as const, username: 'old_u_11' }];
+    const over11Res = mergeOldAccounts([elevenUnique], { type: 'pppoe', username: 'active_user_51' });
+    assert.equal(over11Res.overflow, true);
+    assert.equal(over11Res.totalUniqueCount, 11);
+    assert.deepEqual(over11Res.accounts, []);
+
+    // 4. appendPendingMarkers() dengan 11 akun wajib fail-closed (corrupted=true, oldAccounts=[], tanpa daftar parsial 10 akun)
+    const overflowMarkerMsg = appendPendingMarkers('Gagal sinkronisasi uji overflow', {
+      needsSessionDisconnect: false,
+      oldAccounts: elevenUnique,
+      stages: { accountProvisioned: false, accountVerified: false, oldAccountsPending: 11, sessionDisconnectPending: false },
+    });
+    const decodedOverflowMeta = decodeV1Meta(overflowMarkerMsg);
+    assert.equal(decodedOverflowMeta.corrupted, true);
+    assert.equal(decodedOverflowMeta.needsSessionDisconnect, true);
+    assert.deepEqual(decodedOverflowMeta.oldAccounts, []);
+
+    // 5. End-to-end PUT /api/customers/:id: pelanggan punya 10 akun lama tertunda -> ganti username menjadi ke-11 -> overflow!
+    // Data billing tetap tersimpan ke PostgreSQL, status='failed', corrupted=true, 0 koneksi & 0 perintah RouterOS
+    await api('POST', '/customers', {
+      id: 'c-sec-51',
+      name: 'Audit Overflow 51',
+      phone: '085100',
+      packageId: 'pkg-10m',
+      packageName: 'Paket 10 Mbps',
+      type: 'pppoe',
+      username: 'sec51_initial',
+      password: 'CustomerSecret51',
+      status: 'active',
+    });
+
+    // Pastikan salah satu akun lama masih ada di mock router untuk membuktikan cleanup TIDAK dijalankan saat overflow
+    mockRouter.pppoeSecrets.push({
+      '.id': '*OVF_51_1',
+      name: 'old_u_1',
+      password: 'Old',
+      profile: 'prof-pppoe-10m',
+      disabled: 'false',
+    });
+
+    const row51 = dbStore.customers.get('c-sec-51')!;
+    row51.router_sync_status = 'failed';
+    row51.router_last_sync_message = appendPendingMarkers('Gagal sebelumnya dengan 10 akun lama tertunda.', {
+      needsSessionDisconnect: false,
+      oldAccounts: tenUnique,
+      stages: { accountProvisioned: false, accountVerified: false, oldAccountsPending: 10, sessionDisconnectPending: false },
+    });
+
+    mockRouter.commandLog = [];
+    const connBeforePutOverflow = mockRouter.connectionCount;
+    const putOverflowRes = await api('PUT', '/customers/c-sec-51', {
+      name: 'Audit Overflow 51 Billing Updated',
+      phone: '085199',
+      packageId: 'pkg-20m',
+      packageName: 'Paket 20 Mbps',
+      type: 'pppoe',
+      username: 'sec51_renamed',
+    });
+    assert.equal(putOverflowRes.status, 200);
+    assert.equal(putOverflowRes.json.data.routerSyncStatus, 'failed');
+    assert.equal(putOverflowRes.json.data.name, 'Audit Overflow 51 Billing Updated');
+    assert.equal(putOverflowRes.json.data.username, 'sec51_renamed');
+
+    // Data billing benar-benar tersimpan di DB meskipun sinkronisasi router ditahan
+    const dbAfterPut51 = dbStore.customers.get('c-sec-51')!;
+    assert.equal(dbAfterPut51.name, 'Audit Overflow 51 Billing Updated');
+    assert.equal(dbAfterPut51.phone, '085199');
+    assert.equal(dbAfterPut51.username, 'sec51_renamed');
+    assert.equal(dbAfterPut51.package_id, 'pkg-20m');
+    assert.equal(dbAfterPut51.router_sync_status, 'failed');
+
+    // Bukti 0 koneksi & 0 perintah RouterOS (tidak ada provisioning, verifikasi, cleanup, maupun disconnect)
+    assert.equal(mockRouter.connectionCount, connBeforePutOverflow, 'PUT saat overflow tidak boleh membuka koneksi RouterOS');
+    assert.equal(mockRouter.commandLog.length, 0, 'PUT saat overflow tidak boleh menjalankan perintah RouterOS');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'old_u_1'), true, 'Akun lama tidak boleh dihapus saat overflow');
+    assert.equal(mockRouter.pppoeSecrets.some((s) => s.name === 'sec51_renamed'), false, 'Akun baru tidak boleh diprovisioning saat overflow');
+
+    const metaAfterPut51 = decodeV1Meta(putOverflowRes.json.data.routerLastSyncMessage);
+    assert.equal(metaAfterPut51.corrupted, true);
+    assert.equal(metaAfterPut51.needsSessionDisconnect, true);
+    assert.deepEqual(metaAfterPut51.oldAccounts, []);
+
+    // 6. Metadata corrupted sebelumnya menghentikan semua operasi RouterOS sebelum mergeOldAccounts pada POST sync-router & PATCH status
+    mockRouter.commandLog = [];
+    const connBeforePatch51 = mockRouter.connectionCount;
+    const patch51 = await api('PATCH', '/customers/c-sec-51/status', { status: 'isolated' });
+    assert.equal(patch51.status, 200);
+    assert.equal(dbStore.customers.get('c-sec-51')?.status, 'isolated', 'Status billing tetap tersimpan ke PostgreSQL');
+    assert.equal(patch51.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforePatch51, 'PATCH saat corrupted tidak boleh membuka koneksi RouterOS');
+    assert.equal(mockRouter.commandLog.length, 0, 'PATCH saat corrupted tidak boleh menjalankan perintah RouterOS');
+    assert.equal(decodeV1Meta(patch51.json.data.routerLastSyncMessage).corrupted, true);
+
+    mockRouter.commandLog = [];
+    const connBeforeRetry51 = mockRouter.connectionCount;
+    const retry51 = await api('POST', '/customers/c-sec-51/sync-router');
+    assert.equal(retry51.status, 422);
+    assert.equal(retry51.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforeRetry51, 'POST sync-router saat corrupted tidak boleh membuka koneksi RouterOS');
+    assert.equal(mockRouter.commandLog.length, 0, 'POST sync-router saat corrupted tidak boleh menjalankan perintah RouterOS');
+
+    // Juga uji PUT ulang ketika prevPending.corrupted sudah true sejak awal -> tetap 0 perintah RouterOS & billing tetap tersimpan
+    mockRouter.commandLog = [];
+    const connBeforePutPreCorrupt = mockRouter.connectionCount;
+    const putPreCorruptRes = await api('PUT', '/customers/c-sec-51', {
+      name: 'Audit Overflow 51 Second Save',
+      username: 'sec51_renamed_again',
+      type: 'hotspot',
+    });
+    assert.equal(putPreCorruptRes.status, 200);
+    assert.equal(dbStore.customers.get('c-sec-51')?.name, 'Audit Overflow 51 Second Save');
+    assert.equal(dbStore.customers.get('c-sec-51')?.username, 'sec51_renamed_again');
+    assert.equal(putPreCorruptRes.json.data.routerSyncStatus, 'failed');
+    assert.equal(mockRouter.connectionCount, connBeforePutPreCorrupt, 'PUT saat prevPending.corrupted tidak boleh membuka koneksi RouterOS');
+    assert.equal(mockRouter.commandLog.length, 0, 'PUT saat prevPending.corrupted tidak boleh menjalankan perintah RouterOS');
   });
 
   // Restore prototypes & stop servers cleanly

@@ -135,8 +135,11 @@ const SENSITIVE_PROP_BOUNDARY_REGEX = new RegExp(`(?:^|[_-])(${SENSITIVE_KEY_ALT
 const SENSITIVE_META_VALUE_KV_REGEX = new RegExp(`\\b(${SENSITIVE_KEY_ALT})\\b["']?\\s*[=:]`, 'i');
 const SENSITIVE_META_VALUE_KEYWORD_REGEX = /\b(mikrotik[_-]?encryption[_-]?keys?|db[_-]?passwords?)\b/i;
 
-const SYNC_META_V1_SPLIT_REGEX = /(\[SYNC_META_V1:[^\]]*\])/g;
-const SYNC_META_V1_CAPTURE_REGEX = /^\[SYNC_META_V1:([^\]]*)\]$/;
+export const MAX_SYNC_META_SCAN_INPUT_LENGTH = 65536;
+export const MAX_SYNC_META_SCAN_MARKERS = 32;
+
+const SYNC_META_V_PREFIX_UPPER = '[SYNC_META_V';
+const SYNC_META_V1_CANONICAL_PREFIX = '[SYNC_META_V1:';
 
 function getActiveEnvSecrets(): string[] {
   const candidates = new Set<string>();
@@ -499,29 +502,177 @@ export function parseSyncMetaV1Payload(
   };
 }
 
+export interface ScannedSyncMetaToken {
+  start: number;
+  end: number;
+  rawText: string;
+  hasClosingBracket: boolean;
+  isCanonicalPrefix: boolean;
+  rawPayload: string;
+  validation: { valid: true; payload: ValidatedSyncMetaPayloadV1 } | { valid: false; reason: string };
+}
+
+export interface SyncMetaScanResult {
+  hasAnyV1Prefix: boolean;
+  hasInvalidOrTruncated: boolean;
+  scanLimitExceeded: boolean;
+  tokens: ScannedSyncMetaToken[];
+}
+
+/**
+ * Pemindai deterministik & terbatas (O(N), tanpa backtracking regex) untuk setiap
+ * kemunculan awalan [SYNC_META_V... termasuk penanda terpotong/tanpa ']' atau penanda ganda.
+ */
+export function scanSyncMetaMarkers(input: string): SyncMetaScanResult {
+  if (typeof input !== 'string' || input.length === 0) {
+    return {
+      hasAnyV1Prefix: false,
+      hasInvalidOrTruncated: false,
+      scanLimitExceeded: false,
+      tokens: [],
+    };
+  }
+
+  const scanLimit = Math.min(input.length, MAX_SYNC_META_SCAN_INPUT_LENGTH);
+  let scanLimitExceeded = input.length > MAX_SYNC_META_SCAN_INPUT_LENGTH && /\[SYNC_META_V/i.test(input);
+  let hasAnyV1Prefix = scanLimitExceeded;
+  let hasInvalidOrTruncated = scanLimitExceeded;
+  const tokens: ScannedSyncMetaToken[] = [];
+
+  let cursor = 0;
+  while (cursor < scanLimit) {
+    const openIdx = input.indexOf('[', cursor);
+    if (openIdx === -1 || openIdx >= scanLimit) break;
+
+    if (
+      openIdx + SYNC_META_V_PREFIX_UPPER.length > scanLimit ||
+      input.slice(openIdx, openIdx + SYNC_META_V_PREFIX_UPPER.length).toUpperCase() !== SYNC_META_V_PREFIX_UPPER
+    ) {
+      cursor = openIdx + 1;
+      continue;
+    }
+
+    hasAnyV1Prefix = true;
+    if (tokens.length >= MAX_SYNC_META_SCAN_MARKERS) {
+      scanLimitExceeded = true;
+      hasInvalidOrTruncated = true;
+      break;
+    }
+
+    const isCanonicalPrefix = input.startsWith(SYNC_META_V1_CANONICAL_PREFIX, openIdx);
+    const searchFrom = isCanonicalPrefix
+      ? openIdx + SYNC_META_V1_CANONICAL_PREFIX.length
+      : openIdx + SYNC_META_V_PREFIX_UPPER.length;
+
+    const closeIdx = input.indexOf(']', searchFrom);
+    const nextOpenIdx = input.indexOf('[', searchFrom);
+
+    let tokenEnd: number;
+    let hasClosingBracket = false;
+    if (closeIdx !== -1 && closeIdx < scanLimit && (nextOpenIdx === -1 || closeIdx < nextOpenIdx)) {
+      tokenEnd = closeIdx + 1;
+      hasClosingBracket = true;
+    } else if (nextOpenIdx !== -1 && nextOpenIdx < scanLimit) {
+      let endBeforeNext = nextOpenIdx;
+      while (endBeforeNext > searchFrom && /\s/.test(input[endBeforeNext - 1])) {
+        endBeforeNext--;
+      }
+      tokenEnd = endBeforeNext;
+      hasClosingBracket = false;
+    } else {
+      tokenEnd = scanLimit;
+      hasClosingBracket = false;
+    }
+
+    const rawText = input.slice(openIdx, tokenEnd);
+    let rawPayload = '';
+    let validation: { valid: true; payload: ValidatedSyncMetaPayloadV1 } | { valid: false; reason: string };
+
+    if (!hasClosingBracket) {
+      hasInvalidOrTruncated = true;
+      validation = {
+        valid: false,
+        reason: 'Penanda sinkronisasi [SYNC_META_V1] terpotong atau tidak lengkap.',
+      };
+    } else if (!isCanonicalPrefix) {
+      hasInvalidOrTruncated = true;
+      validation = {
+        valid: false,
+        reason: 'Format awalan penanda [SYNC_META_V1] tidak valid.',
+      };
+    } else {
+      const payloadLen = closeIdx - searchFrom;
+      if (payloadLen > MAX_SYNC_META_V1_B64_LENGTH + 32) {
+        hasInvalidOrTruncated = true;
+        validation = {
+          valid: false,
+          reason: 'Ukuran penanda [SYNC_META_V1] kosong atau melebihi batas aman.',
+        };
+      } else {
+        rawPayload = input.slice(searchFrom, closeIdx);
+        validation = parseSyncMetaV1Payload(rawPayload);
+        if (!validation.valid) {
+          hasInvalidOrTruncated = true;
+        }
+      }
+    }
+
+    tokens.push({
+      start: openIdx,
+      end: tokenEnd,
+      rawText,
+      hasClosingBracket,
+      isCanonicalPrefix,
+      rawPayload,
+      validation,
+    });
+
+    cursor = Math.max(tokenEnd, openIdx + 1);
+  }
+
+  return {
+    hasAnyV1Prefix,
+    hasInvalidOrTruncated,
+    scanLimitExceeded,
+    tokens,
+  };
+}
+
 /**
  * Membersihkan teks dari potensi kebocoran kredensial, ciphertext, URI DB, atau stack trace.
- * Tetap mempertahankan penanda terstruktur [SYNC_META_V1:...] yang valid secara skema & ukuran.
+ * Tetap mempertahankan penanda terstruktur [SYNC_META_V1:...] yang valid secara skema & ukuran,
+ * dan mengganti penanda rusak/terpotong dengan [INVALID_SYNC_META].
  */
 export function redactSensitiveText(input: unknown): string {
   if (typeof input !== 'string') return '';
   if (!input.trim()) return '';
 
-  const parts = input.split(SYNC_META_V1_SPLIT_REGEX);
-  const cleanedParts = parts.map((part) => {
-    if (!part) return '';
-    const markerMatch = part.match(SYNC_META_V1_CAPTURE_REGEX);
-    if (markerMatch) {
-      const check = parseSyncMetaV1Payload(markerMatch[1]);
-      return check.valid ? part : '[INVALID_SYNC_META]';
-    }
-    return redactTextSegment(part);
-  });
+  const scan = scanSyncMetaMarkers(input);
+  if (scan.tokens.length === 0 && !scan.scanLimitExceeded) {
+    return redactTextSegment(input).replace(/\s{2,}/g, ' ').trim();
+  }
 
-  return cleanedParts.join('').replace(/\s{2,}/g, ' ').trim();
+  const out: string[] = [];
+  let cursor = 0;
+  for (const tok of scan.tokens) {
+    if (tok.start > cursor) {
+      out.push(redactTextSegment(input.slice(cursor, tok.start)));
+    }
+    out.push(!scan.hasInvalidOrTruncated && tok.validation.valid ? tok.rawText : '[INVALID_SYNC_META]');
+    cursor = tok.end;
+  }
+  if (cursor < input.length) {
+    let tail = input.slice(cursor);
+    if (scan.scanLimitExceeded) {
+      tail = tail.replace(/\[SYNC_META_V[^\]]*(?:\]|$)/gi, '[INVALID_SYNC_META]');
+    }
+    out.push(redactTextSegment(tail));
+  }
+
+  return out.join('').replace(/\s{2,}/g, ' ').trim();
 }
 
-function containsUnsafeInternalPattern(raw: string): boolean {
+export function containsUnsafeInternalPattern(raw: string): boolean {
   if (/(!trap|!fatal|=message=|=ret=|=.id=)/i.test(raw)) return true;
   if (/\b(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE)\b[\s\S]{0,160}\b(FROM|INTO|TABLE|SET|WHERE)\b/i.test(raw)) {
     return true;

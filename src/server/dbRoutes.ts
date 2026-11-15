@@ -31,7 +31,9 @@ import {
   sanitizeMikrotikError,
   sanitizeGenericServerError,
   redactSensitiveText,
+  containsUnsafeInternalPattern,
   parseSyncMetaV1Payload,
+  scanSyncMetaMarkers,
   MAX_SYNC_META_V1_OLD_ACCOUNTS,
   MAX_SYNC_META_V1_USERNAME_LENGTH,
   toAllowedErrorCode,
@@ -85,11 +87,25 @@ function validateSafeCustomerUsername(username: string): { valid: boolean; clean
   return { valid: true, clean };
 }
 
-function stripPendingMarkersFromMessage(message: string): string {
-  return message
-    .replace(/\s*\[SYNC_META_V1:[^\]]*\]/g, '')
+export function stripPendingMarkersFromMessage(message: string): string {
+  const scan = scanSyncMetaMarkers(message);
+  let withoutV1 = '';
+  let cursor = 0;
+  for (const tok of scan.tokens) {
+    withoutV1 += message.slice(cursor, tok.start);
+    cursor = tok.end;
+  }
+  withoutV1 += message.slice(cursor);
+  if (scan.scanLimitExceeded) {
+    withoutV1 = withoutV1.replace(/\s*\[SYNC_META_V[^\]]*(?:\]|$)/gi, '');
+  }
+
+  return withoutV1
+    .replace(/\s*\[INVALID_SYNC_META\]/g, '')
     .replace(/\s*\[Perlu ulang pemutusan sesi\]/gi, '')
     .replace(/\s*\[Perlu pembersihan akun lama:[^\]]*\]/gi, '')
+    .replace(/\s*\[Perlu pembersihan akun lama:[^\[]*$/gi, '')
+    .replace(/\s{2,}/g, ' ')
     .trim();
 }
 
@@ -116,110 +132,169 @@ export function parsePendingSyncActions(lastSyncStatus?: string | null, lastSync
     }
   };
 
-  // 1. Parse format terstruktur ber-versi [SYNC_META_V1:<base64url>]
-  const v1Matches = [...msg.matchAll(/\[SYNC_META_V1:([^\]]*)\]/g)];
-  const hasV1Prefix = /\[SYNC_META_V/i.test(msg);
+  // 1. Pindai seluruh kemunculan awalan [SYNC_META_V... secara deterministik (fail-closed)
+  const scan = scanSyncMetaMarkers(msg);
+  const hasInvalidPlaceholder = msg.includes('[INVALID_SYNC_META]');
 
-  if (hasV1Prefix && v1Matches.length === 0) {
-    corrupted = true;
-    corruptedReason = 'Penanda sinkronisasi [SYNC_META_V1] terpotong atau tidak lengkap.';
-  }
-
-  for (const match of v1Matches) {
-    const rawB64 = (match[1] || '').trim();
-    const validation = parseSyncMetaV1Payload(rawB64);
-    if (!validation.valid) {
+  if (scan.hasAnyV1Prefix || hasInvalidPlaceholder) {
+    if (hasInvalidPlaceholder && !scan.hasAnyV1Prefix) {
       corrupted = true;
-      corruptedReason = validation.reason;
-      continue;
-    }
-
-    const parsed = validation.payload;
-    if (oldAccounts.length + parsed.oldAccounts.length > MAX_SYNC_META_V1_OLD_ACCOUNTS) {
+      corruptedReason = 'Penanda sinkronisasi [SYNC_META_V1] sebelumnya tidak valid.';
+    } else if (scan.scanLimitExceeded) {
       corrupted = true;
-      corruptedReason = 'Total akun lama pada penanda [SYNC_META_V1] melebihi batas aman.';
-      continue;
-    }
-
-    for (const item of parsed.oldAccounts) {
-      addOldAcc(item.type, item.username);
-    }
-
-    if (parsed.corrupted === true) {
+      corruptedReason = 'Jumlah atau ukuran penanda sinkronisasi [SYNC_META_V1] melebihi batas aman.';
+    } else if (scan.tokens.length === 0 || scan.hasInvalidOrTruncated) {
       corrupted = true;
-      corruptedReason = 'Status kegagalan sebelumnya menandai penanda sinkronisasi rusak dan butuh pemeriksaan manual.';
+      const firstInvalid = scan.tokens.find((t) => !t.validation.valid);
+      corruptedReason =
+        firstInvalid && !firstInvalid.validation.valid
+          ? firstInvalid.validation.reason
+          : 'Penanda sinkronisasi [SYNC_META_V1] terpotong atau tidak lengkap.';
     } else {
-      validV1Count++;
+      for (const tok of scan.tokens) {
+        if (!tok.validation.valid) {
+          corrupted = true;
+          corruptedReason = tok.validation.reason;
+          break;
+        }
+        const parsed = tok.validation.payload;
+        if (parsed.corrupted === true) {
+          corrupted = true;
+          corruptedReason = 'Status kegagalan sebelumnya menandai penanda sinkronisasi rusak dan butuh pemeriksaan manual.';
+          break;
+        }
+        if (oldAccounts.length + parsed.oldAccounts.length > MAX_SYNC_META_V1_OLD_ACCOUNTS) {
+          corrupted = true;
+          corruptedReason = 'Total akun lama pada penanda [SYNC_META_V1] melebihi batas aman.';
+          break;
+        }
+
+        for (const item of parsed.oldAccounts) {
+          addOldAcc(item.type, item.username);
+        }
+        validV1Count++;
+        if (parsed.needsSessionDisconnect) {
+          needsSessionDisconnect = true;
+        }
+        if (parsed.stages) {
+          stages = { ...stages, ...parsed.stages };
+        }
+      }
     }
-    if (parsed.needsSessionDisconnect) {
-      needsSessionDisconnect = true;
+
+    // Prinsip fail-closed: jika ada satu saja penanda V1 yang rusak/terpotong,
+    // JANGAN gunakan sebagian metadata V1 dan JANGAN jalankan fallback legacy.
+    if (corrupted || validV1Count === 0) {
+      return {
+        needsSessionDisconnect: true,
+        oldAccounts: [],
+        corrupted: true,
+        corruptedReason: corruptedReason || 'Penanda sinkronisasi [SYNC_META_V1] tidak valid.',
+      };
     }
-    if (parsed.stages) {
-      stages = { ...stages, ...parsed.stages };
-    }
+
+    return { needsSessionDisconnect, oldAccounts, corrupted: false, stages };
   }
 
-  // 2. Kompatibilitas mundur dengan penanda versi lama & fallback saat metadata V1 tidak tersedia atau rusak.
-  // Jika metadata SYNC_META_V1 valid dan tidak rusak, metadata V1 adalah satu-satunya sumber kebenaran.
-  const hasValidV1 = validV1Count > 0 && !corrupted;
-  if (!hasValidV1) {
-    if (
-      msg.includes('[Perlu ulang pemutusan sesi]') ||
-      /(?<!akun lama )pemutusan sesi aktif(?! akun lama).*gagal|sesi aktif gagal diputus/i.test(msg)
-    ) {
-      needsSessionDisconnect = true;
-    }
+  // 2. Kompatibilitas mundur format legacy hanya jika TIDAK ditemukan awalan V1 sama sekali.
+  if (
+    msg.includes('[Perlu ulang pemutusan sesi]') ||
+    /(?<!akun lama )pemutusan sesi aktif(?! akun lama).*gagal|sesi aktif gagal diputus/i.test(msg)
+  ) {
+    needsSessionDisconnect = true;
+  }
 
-    const hasLegacyCleanupStart = /\[Perlu pembersihan akun lama:/i.test(msg);
-    const legacyMatches = [...msg.matchAll(/\[Perlu pembersihan akun lama:\s*([^\]]*)\]/gi)];
-    if (hasLegacyCleanupStart && legacyMatches.length === 0) {
-      corrupted = true;
-      corruptedReason = corruptedReason || 'Penanda lama [Perlu pembersihan akun lama] terpotong.';
-    }
-    for (const blockMatch of legacyMatches) {
-      const entries = blockMatch[1].split(',');
-      for (const rawEntry of entries) {
-        const m = rawEntry.trim().match(/^(pppoe|hotspot):(.+)$/i);
-        if (m && m[2].trim()) {
-          addOldAcc(m[1].toLowerCase() as 'pppoe' | 'hotspot', m[2].trim());
-        } else if (rawEntry.trim()) {
+  const legacyStartMatches = [...msg.matchAll(/\[Perlu pembersihan akun lama:/gi)];
+  const legacyMatches = [...msg.matchAll(/\[Perlu pembersihan akun lama:\s*([^\]]*)\]/gi)];
+  if (legacyStartMatches.length !== legacyMatches.length) {
+    corrupted = true;
+    corruptedReason = 'Penanda lama [Perlu pembersihan akun lama] terpotong.';
+  }
+  let totalLegacyEntries = 0;
+  for (const blockMatch of legacyMatches) {
+    if (corrupted) break;
+    const entries = blockMatch[1].split(',');
+    for (const rawEntry of entries) {
+      const trimmedEntry = rawEntry.trim();
+      if (!trimmedEntry) continue;
+      const m = trimmedEntry.match(/^(pppoe|hotspot):(.+)$/i);
+      if (m && m[2].trim()) {
+        totalLegacyEntries++;
+        if (totalLegacyEntries > MAX_SYNC_META_V1_OLD_ACCOUNTS || oldAccounts.length >= MAX_SYNC_META_V1_OLD_ACCOUNTS) {
           corrupted = true;
-          corruptedReason = corruptedReason || 'Entri penanda lama tidak dapat dibaca.';
+          corruptedReason = 'Total akun lama pada penanda legacy melebihi batas aman.';
+          break;
         }
+        addOldAcc(m[1].toLowerCase() as 'pppoe' | 'hotspot', m[2].trim());
+      } else {
+        corrupted = true;
+        corruptedReason = corruptedReason || 'Entri penanda lama tidak dapat dibaca.';
+        break;
       }
     }
   }
 
   if (corrupted) {
-    needsSessionDisconnect = true;
+    return {
+      needsSessionDisconnect: true,
+      oldAccounts: [],
+      corrupted: true,
+      corruptedReason,
+    };
   }
 
-  return { needsSessionDisconnect, oldAccounts, corrupted, corruptedReason, stages };
+  return { needsSessionDisconnect, oldAccounts, corrupted: false, stages };
 }
 
-function mergeOldAccounts(
+export interface MergeOldAccountsResult {
+  accounts: PendingRouterAccount[];
+  overflow: boolean;
+  totalUniqueCount: number;
+}
+
+export function mergeOldAccounts(
   lists: PendingRouterAccount[][],
-  excludeCurrent?: PendingRouterAccount
-): PendingRouterAccount[] {
-  const result: PendingRouterAccount[] = [];
+  excludeCurrent?: PendingRouterAccount,
+  maxAccounts: number = MAX_SYNC_META_V1_OLD_ACCOUNTS
+): MergeOldAccountsResult {
+  const safeMax = Number.isInteger(maxAccounts) && maxAccounts >= 0 ? maxAccounts : MAX_SYNC_META_V1_OLD_ACCOUNTS;
+  const uniqueAccounts: PendingRouterAccount[] = [];
   const seen = new Set<string>();
   const excludeKey = excludeCurrent
     ? `${excludeCurrent.type}:${excludeCurrent.username.trim()}`
     : null;
 
   for (const list of lists) {
+    if (!Array.isArray(list)) continue;
     for (const item of list) {
+      if (!item || (item.type !== 'pppoe' && item.type !== 'hotspot') || typeof item.username !== 'string') {
+        continue;
+      }
       const cleanUser = item.username.trim();
       if (!cleanUser) continue;
       const key = `${item.type}:${cleanUser}`;
       if (excludeKey && key === excludeKey) continue;
       if (!seen.has(key)) {
         seen.add(key);
-        result.push({ type: item.type, username: cleanUser });
+        uniqueAccounts.push({ type: item.type, username: cleanUser });
       }
     }
   }
-  return result;
+
+  const totalUniqueCount = uniqueAccounts.length;
+  if (totalUniqueCount > safeMax) {
+    return {
+      accounts: [],
+      overflow: true,
+      totalUniqueCount,
+    };
+  }
+
+  return {
+    accounts: uniqueAccounts,
+    overflow: false,
+    totalUniqueCount,
+  };
 }
 
 const MAX_OPERATION_MESSAGE_LENGTH = 260;
@@ -333,17 +408,36 @@ function finalizeSafeSyncText(message: string, maxLen: number = MAX_SYNC_TEXT_LE
   return truncateSafeMessage(redactSensitiveText(clean), maxLen);
 }
 
-function sanitizeSyncMessagePreservingMeta(message: string | null | undefined): string {
+export function sanitizeSyncMessagePreservingMeta(message: string | null | undefined): string {
   if (!message || typeof message !== 'string') return '';
-  const validV1Tags = [...message.matchAll(/\[SYNC_META_V1:([^\]]*)\]/g)]
-    .filter((m) => parseSyncMetaV1Payload(m[1]).valid)
-    .map((m) => `[SYNC_META_V1:${m[1].trim()}]`);
-  const cleanBody = finalizeSafeSyncText(message.replace(/\s*\[SYNC_META_V1:[^\]]*\]/g, ''));
+  const scan = scanSyncMetaMarkers(message);
+  let bodyOnly = '';
+  let cursor = 0;
+  for (const tok of scan.tokens) {
+    bodyOnly += message.slice(cursor, tok.start);
+    cursor = tok.end;
+  }
+  bodyOnly += message.slice(cursor);
+  if (scan.scanLimitExceeded) {
+    bodyOnly = bodyOnly.replace(/\s*\[SYNC_META_V[^\]]*(?:\]|$)/gi, '');
+  }
+
+  const rawBodyClean = stripPendingMarkersFromMessage(bodyOnly);
+  const cleanBody = containsUnsafeInternalPattern(rawBodyClean)
+    ? 'Status sinkronisasi router memerlukan pemeriksaan manual.'
+    : finalizeSafeSyncText(rawBodyClean);
+  if (scan.hasInvalidOrTruncated || scan.scanLimitExceeded) {
+    return cleanBody ? `${cleanBody} [INVALID_SYNC_META]` : '[INVALID_SYNC_META]';
+  }
+
+  const validV1Tags = scan.tokens
+    .filter((t) => t.validation.valid)
+    .map((t) => `[SYNC_META_V1:${t.rawPayload.trim()}]`);
   if (validV1Tags.length === 0) return cleanBody;
   return cleanBody ? `${cleanBody} ${validV1Tags.join(' ')}` : validV1Tags.join(' ');
 }
 
-function appendPendingMarkers(
+export function appendPendingMarkers(
   baseMessage: string,
   pending: {
     needsSessionDisconnect: boolean;
@@ -361,10 +455,6 @@ function appendPendingMarkers(
   const safeOldAccounts: PendingRouterAccount[] = [];
   const seen = new Set<string>();
   for (const item of pending.oldAccounts) {
-    if (safeOldAccounts.length >= MAX_SYNC_META_V1_OLD_ACCOUNTS) {
-      forceCorrupted = true;
-      break;
-    }
     if (!item || (item.type !== 'pppoe' && item.type !== 'hotspot') || typeof item.username !== 'string') {
       forceCorrupted = true;
       continue;
@@ -380,10 +470,18 @@ function appendPendingMarkers(
     }
     const key = `${item.type}:${cleanUser}`;
     if (!seen.has(key)) {
+      if (safeOldAccounts.length >= MAX_SYNC_META_V1_OLD_ACCOUNTS) {
+        forceCorrupted = true;
+        break;
+      }
       seen.add(key);
       safeOldAccounts.push({ type: item.type, username: cleanUser });
     }
   }
+
+  // Fail-closed: jika metadata rusak atau overflow (> MAX_SYNC_META_V1_OLD_ACCOUNTS),
+  // JANGAN menyimpan daftar parsial yang tampak seolah-olah lengkap.
+  const finalOldAccounts = forceCorrupted ? [] : safeOldAccounts;
 
   const cleanStages: PendingSyncStages | undefined = pending.stages
     ? {
@@ -393,10 +491,12 @@ function appendPendingMarkers(
         ...(typeof pending.stages.accountVerified === 'boolean'
           ? { accountVerified: pending.stages.accountVerified }
           : {}),
-        ...(typeof pending.stages.oldAccountsPending === 'number' &&
+        ...(!forceCorrupted &&
+        typeof pending.stages.oldAccountsPending === 'number' &&
         Number.isInteger(pending.stages.oldAccountsPending) &&
-        pending.stages.oldAccountsPending >= 0
-          ? { oldAccountsPending: Math.min(pending.stages.oldAccountsPending, MAX_SYNC_META_V1_OLD_ACCOUNTS) }
+        pending.stages.oldAccountsPending >= 0 &&
+        pending.stages.oldAccountsPending <= MAX_SYNC_META_V1_OLD_ACCOUNTS
+          ? { oldAccountsPending: pending.stages.oldAccountsPending }
           : {}),
         ...(typeof pending.stages.sessionDisconnectPending === 'boolean'
           ? { sessionDisconnectPending: pending.stages.sessionDisconnectPending }
@@ -407,7 +507,7 @@ function appendPendingMarkers(
   const payload: PendingSyncPayloadV1 = {
     v: 1,
     needsSessionDisconnect: Boolean(pending.needsSessionDisconnect || forceCorrupted),
-    oldAccounts: safeOldAccounts,
+    oldAccounts: finalOldAccounts,
     ...(forceCorrupted ? { corrupted: true } : {}),
     ...(cleanStages ? { stages: cleanStages } : {}),
   };
@@ -1412,13 +1512,69 @@ router.put('/customers/:id', async (req: Request, res: Response) => {
     const isDisabled = (c.status || existing.status) !== 'active';
 
     const prevPending = parsePendingSyncActions(existing.router_sync_status, existing.router_last_sync_message);
-    const pendingOldAccounts = mergeOldAccounts(
+
+    // Prinsip fail-closed: periksa prevPending.corrupted SEBELUM mergeOldAccounts() dan operasi RouterOS apa pun
+    if (prevPending.corrupted) {
+      const errMsg = appendPendingMarkers(
+        `Data billing diperbarui di PostgreSQL, namun penanda sinkronisasi sebelumnya rusak (${prevPending.corruptedReason || 'format tidak valid'}). Sinkronisasi ke router ditahan 'failed' untuk pemeriksaan manual.`,
+        {
+          needsSessionDisconnect: true,
+          oldAccounts: [],
+          corrupted: true,
+          stages: {
+            accountProvisioned: false,
+            accountVerified: false,
+            sessionDisconnectPending: true,
+          },
+        }
+      );
+      if (schema.customers) {
+        await query(
+          `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
+          [errMsg, id]
+        );
+        updatedCustomer.routerSyncStatus = 'failed';
+        updatedCustomer.routerLastSyncAt = new Date().toISOString();
+        updatedCustomer.routerLastSyncMessage = errMsg;
+      }
+      return res.json({ success: true, message: 'Data pelanggan berhasil diperbarui di PostgreSQL.', data: updatedCustomer });
+    }
+
+    const mergeRes = mergeOldAccounts(
       [
         prevPending.oldAccounts,
         accountIdentityChanged && existingUsername ? [{ type: existingType, username: existingUsername }] : [],
       ],
       { type: targetType, username: cleanUsername }
     );
+
+    if (mergeRes.overflow) {
+      const errMsg = appendPendingMarkers(
+        `Data billing diperbarui di PostgreSQL, namun daftar akun lama tertunda (${mergeRes.totalUniqueCount}) melebihi batas aman ${MAX_SYNC_META_V1_OLD_ACCOUNTS} akun. Sinkronisasi ke router ditahan 'failed' untuk pemeriksaan manual.`,
+        {
+          needsSessionDisconnect: true,
+          oldAccounts: [],
+          corrupted: true,
+          stages: {
+            accountProvisioned: false,
+            accountVerified: false,
+            sessionDisconnectPending: true,
+          },
+        }
+      );
+      if (schema.customers) {
+        await query(
+          `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
+          [errMsg, id]
+        );
+        updatedCustomer.routerSyncStatus = 'failed';
+        updatedCustomer.routerLastSyncAt = new Date().toISOString();
+        updatedCustomer.routerLastSyncMessage = errMsg;
+      }
+      return res.json({ success: true, message: 'Data pelanggan berhasil diperbarui di PostgreSQL.', data: updatedCustomer });
+    }
+
+    const pendingOldAccounts = mergeRes.accounts;
     const pendingDisconnectNeeded =
       packageChanged ||
       isDisabled ||
@@ -1752,60 +1908,36 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
     const isDisabled = status !== 'active';
     const isHotspot = updatedCustomer.type === 'hotspot';
     const cleanUsername = (updatedCustomer.username || '').trim();
-    const pendingOldAccounts = mergeOldAccounts([prevPending.oldAccounts], {
-      type: isHotspot ? 'hotspot' : 'pppoe',
-      username: cleanUsername,
-    });
-    const pendingDisconnect = prevPending.needsSessionDisconnect || isDisabled;
 
     // Sinkronisasi status aktif / nonaktif (disable) ke router MikroTik
-    const routerOptions = await getActiveRouterOptions();
-    if (!routerOptions) {
-      const errMsg = appendPendingMarkers(
-        'Router MikroTik tidak terhubung atau password API belum tersimpan. Status pelanggan di billing diubah, namun belum dapat diterapkan ke router.',
-        {
-          needsSessionDisconnect: pendingDisconnect,
-          oldAccounts: pendingOldAccounts,
-          corrupted: prevPending.corrupted,
-        }
-      );
-      if (schema.customers) {
-        await query(
-          `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
-          [errMsg, id]
-        );
-        updatedCustomer.routerSyncStatus = 'failed';
-        updatedCustomer.routerLastSyncAt = new Date().toISOString();
-        updatedCustomer.routerLastSyncMessage = errMsg;
+    // Prinsip fail-closed: periksa metadata corrupted SEBELUM mergeOldAccounts() dan operasi router apa pun
+    let pendingOldAccounts: PendingRouterAccount[] = [];
+    let pendingDisconnect = prevPending.needsSessionDisconnect || isDisabled;
+    let holdDueToOverflow = false;
+    let overflowCount = 0;
+
+    if (!prevPending.corrupted) {
+      const mergeRes = mergeOldAccounts([prevPending.oldAccounts], {
+        type: isHotspot ? 'hotspot' : 'pppoe',
+        username: cleanUsername,
+      });
+      if (mergeRes.overflow) {
+        holdDueToOverflow = true;
+        overflowCount = mergeRes.totalUniqueCount;
+      } else {
+        pendingOldAccounts = mergeRes.accounts;
       }
-    } else if (!cleanUsername) {
-      const errMsg = appendPendingMarkers(
-        'Username koneksi pelanggan kosong. Status akun tidak dapat disinkronkan ke router.',
-        {
-          needsSessionDisconnect: pendingDisconnect,
-          oldAccounts: pendingOldAccounts,
-          corrupted: prevPending.corrupted,
-        }
-      );
-      if (schema.customers) {
-        await query(
-          `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
-          [errMsg, id]
-        );
-        updatedCustomer.routerSyncStatus = 'failed';
-        updatedCustomer.routerLastSyncAt = new Date().toISOString();
-        updatedCustomer.routerLastSyncMessage = errMsg;
-      }
-    } else if (prevPending.corrupted) {
-      // Penanda sebelumnya rusak -> jangan pernah menghapus pekerjaan atau menandai synced
-      const errMsg = appendPendingMarkers(
-        `Status billing diubah menjadi '${status}', namun penanda sinkronisasi sebelumnya rusak/tidak terbaca. Status ditahan 'failed' untuk pemeriksaan manual.`,
-        {
-          needsSessionDisconnect: true,
-          oldAccounts: pendingOldAccounts,
-          corrupted: true,
-        }
-      );
+    }
+
+    if (prevPending.corrupted || holdDueToOverflow) {
+      const holdReasonMsg = prevPending.corrupted
+        ? `Status billing diubah menjadi '${status}', namun penanda sinkronisasi sebelumnya rusak/tidak terbaca. Status ditahan 'failed' untuk pemeriksaan manual.`
+        : `Status billing diubah menjadi '${status}', namun daftar akun lama tertunda (${overflowCount}) melebihi batas aman ${MAX_SYNC_META_V1_OLD_ACCOUNTS} akun. Status ditahan 'failed' untuk pemeriksaan manual.`;
+      const errMsg = appendPendingMarkers(holdReasonMsg, {
+        needsSessionDisconnect: true,
+        oldAccounts: [],
+        corrupted: true,
+      });
       if (schema.customers) {
         await query(
           `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
@@ -1816,6 +1948,44 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
         updatedCustomer.routerLastSyncMessage = errMsg;
       }
     } else {
+      const routerOptions = await getActiveRouterOptions();
+      if (!routerOptions) {
+        const errMsg = appendPendingMarkers(
+          'Router MikroTik tidak terhubung atau password API belum tersimpan. Status pelanggan di billing diubah, namun belum dapat diterapkan ke router.',
+          {
+            needsSessionDisconnect: pendingDisconnect,
+            oldAccounts: pendingOldAccounts,
+            corrupted: prevPending.corrupted,
+          }
+        );
+        if (schema.customers) {
+          await query(
+            `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
+            [errMsg, id]
+          );
+          updatedCustomer.routerSyncStatus = 'failed';
+          updatedCustomer.routerLastSyncAt = new Date().toISOString();
+          updatedCustomer.routerLastSyncMessage = errMsg;
+        }
+      } else if (!cleanUsername) {
+        const errMsg = appendPendingMarkers(
+          'Username koneksi pelanggan kosong. Status akun tidak dapat disinkronkan ke router.',
+          {
+            needsSessionDisconnect: pendingDisconnect,
+            oldAccounts: pendingOldAccounts,
+            corrupted: prevPending.corrupted,
+          }
+        );
+        if (schema.customers) {
+          await query(
+            `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
+            [errMsg, id]
+          );
+          updatedCustomer.routerSyncStatus = 'failed';
+          updatedCustomer.routerLastSyncAt = new Date().toISOString();
+          updatedCustomer.routerLastSyncMessage = errMsg;
+        }
+      } else {
       try {
         if (isHotspot) {
           await mtDeps.toggleHotspotUser(routerOptions, cleanUsername, isDisabled);
@@ -1938,6 +2108,7 @@ router.patch('/customers/:id/status', async (req: Request, res: Response) => {
           updatedCustomer.routerLastSyncMessage = errMsg;
         }
       }
+      }
     }
 
     res.json({ success: true, message: `Status pelanggan berhasil diubah menjadi ${status}.`, data: updatedCustomer });
@@ -1971,25 +2142,21 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
 
     // Baca kondisi sinkronisasi terakhir pelanggan untuk menentukan operasi wajib yang tertunda
     const parsedPrev = parsePendingSyncActions(customer.router_sync_status, customer.router_last_sync_message);
-    const pendingOldAccounts = mergeOldAccounts([parsedPrev.oldAccounts], {
-      type: targetType,
-      username: cleanUsername,
-    });
     const needsSessionDisconnect = parsedPrev.needsSessionDisconnect || isDisabled;
-    prevPending = {
-      needsSessionDisconnect,
-      oldAccounts: pendingOldAccounts,
-      corrupted: parsedPrev.corrupted,
-      corruptedReason: parsedPrev.corruptedReason,
-    };
 
-    // Jika data penanda rusak / korup -> gagalkan dengan aman & jangan menandai synced
+    // Jika data penanda rusak / korup -> gagalkan SEBELUM mergeOldAccounts() dan operasi router apa pun
     if (parsedPrev.corrupted) {
+      prevPending = {
+        needsSessionDisconnect: true,
+        oldAccounts: [],
+        corrupted: true,
+        corruptedReason: parsedPrev.corruptedReason,
+      };
       const corruptMsg = appendPendingMarkers(
         `Penanda pekerjaan sinkronisasi sebelumnya rusak (${parsedPrev.corruptedReason || 'format tidak valid'}). Harap periksa status akun di router secara manual sebelum melanjutkan.`,
         {
           needsSessionDisconnect: true,
-          oldAccounts: pendingOldAccounts,
+          oldAccounts: [],
           corrupted: true,
         }
       );
@@ -2012,6 +2179,53 @@ router.post('/customers/:id/sync-router', async (req: Request, res: Response) =>
         },
       });
     }
+
+    const mergeRes = mergeOldAccounts([parsedPrev.oldAccounts], {
+      type: targetType,
+      username: cleanUsername,
+    });
+
+    if (mergeRes.overflow) {
+      prevPending = {
+        needsSessionDisconnect: true,
+        oldAccounts: [],
+        corrupted: true,
+        corruptedReason: `Jumlah akun lama tertunda (${mergeRes.totalUniqueCount}) melebihi batas aman ${MAX_SYNC_META_V1_OLD_ACCOUNTS}.`,
+      };
+      const overflowMsg = appendPendingMarkers(
+        `Daftar akun lama tertunda (${mergeRes.totalUniqueCount}) melebihi batas aman ${MAX_SYNC_META_V1_OLD_ACCOUNTS} akun. Harap periksa status akun di router secara manual sebelum melanjutkan.`,
+        {
+          needsSessionDisconnect: true,
+          oldAccounts: [],
+          corrupted: true,
+        }
+      );
+      const nowIso = new Date().toISOString();
+      if (schema.customers) {
+        await query(
+          `UPDATE customers SET router_sync_status = 'failed', router_last_sync_at = CURRENT_TIMESTAMP, router_last_sync_message = $1 WHERE id = $2`,
+          [overflowMsg, id]
+        );
+      }
+      return res.status(422).json({
+        success: false,
+        message: overflowMsg,
+        data: {
+          id: customer.id,
+          username: cleanUsername,
+          routerSyncStatus: 'failed',
+          routerLastSyncAt: nowIso,
+          routerLastSyncMessage: overflowMsg,
+        },
+      });
+    }
+
+    const pendingOldAccounts = mergeRes.accounts;
+    prevPending = {
+      needsSessionDisconnect,
+      oldAccounts: pendingOldAccounts,
+      corrupted: false,
+    };
 
     // Cek password pelanggan
     if (!customer.password_encrypted) {
