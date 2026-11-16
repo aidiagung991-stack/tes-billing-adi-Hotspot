@@ -1,4 +1,6 @@
 import net from 'node:net';
+import tls from 'node:tls';
+import dns from 'node:dns';
 import http from 'node:http';
 import assert from 'node:assert/strict';
 import express from 'express';
@@ -567,7 +569,14 @@ class MockRouterOsServer {
 // 2. IN-MEMORY POSTGRESQL MOCK (PATCHES pg.Pool FOR END-TO-END dbRoutes TESTS)
 // ============================================================================
 class MockPostgresStore {
+  routerHost = '192.168.88.1';
+  routerName = 'MockRB4011';
+  routerModelTarget = 'RB4011iGS+RM';
   routerPort = 8728;
+  routerUsername = 'admin';
+  routerUseSsl = false;
+  routerTimeoutSeconds = 5;
+  routerConfigMissing = false;
   routerPasswordEncrypted = '';
   routerLastStatusMessage: string | null = null;
   packages = new Map<string, MockPackageRow>();
@@ -576,7 +585,14 @@ class MockPostgresStore {
   injectErrorOnPattern: { pattern: RegExp; error: any } | null = null;
 
   reset(routerPort: number, routerPasswordEncrypted: string) {
+    this.routerHost = '192.168.88.1';
+    this.routerName = 'MockRB4011';
+    this.routerModelTarget = 'RB4011iGS+RM';
     this.routerPort = routerPort;
+    this.routerUsername = 'admin';
+    this.routerUseSsl = false;
+    this.routerTimeoutSeconds = 5;
+    this.routerConfigMissing = false;
     this.routerPasswordEncrypted = routerPasswordEncrypted;
     this.routerLastStatusMessage = null;
     this.packages.clear();
@@ -667,20 +683,54 @@ class MockPostgresStore {
       return { rows: [], rowCount: 0 };
     }
 
+    if (q.startsWith('SELECT password_encrypted, password_hash, status FROM mikrotik_settings')) {
+      if (this.routerConfigMissing) {
+        return { rows: [], rowCount: 0 };
+      }
+      return {
+        rows: [
+          {
+            password_encrypted: this.routerPasswordEncrypted,
+            password_hash: null,
+            status: 'disconnected',
+          },
+        ],
+        rowCount: 1,
+      };
+    }
+
+    if (q.startsWith('INSERT INTO mikrotik_settings')) {
+      this.routerConfigMissing = false;
+      this.routerName = params[1] || 'MikroTik RB4011';
+      this.routerHost = params[2] || this.routerHost;
+      this.routerPort = Number(params[3]) || this.routerPort;
+      this.routerUsername = params[4] || 'admin';
+      if (params[5]) {
+        this.routerPasswordEncrypted = params[5];
+      }
+      this.routerModelTarget = params[7] || 'RB4011iGS+RM';
+      this.routerUseSsl = Boolean(params[9]);
+      this.routerTimeoutSeconds = Number(params[10]) || 10;
+      return { rows: [], rowCount: 1 };
+    }
+
     if (q.includes('FROM mikrotik_settings') && q.includes('AS "isPasswordConfigured"')) {
+      if (this.routerConfigMissing) {
+        return { rows: [], rowCount: 0 };
+      }
       return {
         rows: [
           {
             id: 'default',
-            routerName: 'MockRB4011',
-            host: '127.0.0.1',
+            routerName: this.routerName,
+            host: this.routerHost,
             apiPort: this.routerPort,
-            username: 'admin',
+            username: this.routerUsername,
             status: 'disconnected',
-            modelTarget: 'RB4011iGS+RM',
+            modelTarget: this.routerModelTarget,
             rosVersionPreview: 'RouterOS v7.14',
-            useSsl: false,
-            timeoutSeconds: 5,
+            useSsl: this.routerUseSsl,
+            timeoutSeconds: this.routerTimeoutSeconds,
             notes: '',
             lastTestedAt: null,
             lastStatusMessage: this.routerLastStatusMessage,
@@ -692,16 +742,19 @@ class MockPostgresStore {
     }
 
     if (q.includes('FROM mikrotik_settings')) {
+      if (this.routerConfigMissing) {
+        return { rows: [], rowCount: 0 };
+      }
       return {
         rows: [
           {
-            host: '127.0.0.1',
+            host: this.routerHost,
             api_port: this.routerPort,
-            username: 'admin',
+            username: this.routerUsername,
             password_encrypted: this.routerPasswordEncrypted,
             password_hash: null,
-            use_ssl: false,
-            timeout_seconds: 5,
+            use_ssl: this.routerUseSsl,
+            timeout_seconds: this.routerTimeoutSeconds,
           },
         ],
         rowCount: 1,
@@ -845,6 +898,84 @@ async function main() {
   // Patch pg.Pool BEFORE importing dbRoutes
   const origQuery = pg.Pool.prototype.query;
   const origConnect = pg.Pool.prototype.connect;
+  const origNetConnect = net.connect;
+  const origTlsConnect = tls.connect;
+  const origDnsLookup = dns.promises.lookup;
+
+  const ignoredTestHttpPorts = new Set<number>();
+  const mockRoutedLanIps = new Set<string>([
+    '192.168.88.1',
+    '10.10.20.1',
+    '10.20.30.1',
+    '172.16.10.1',
+    '172.31.255.1',
+  ]);
+  const socketConnectEvents: Array<{ transport: 'tcp' | 'tls'; host: string; port: number; family?: number }> = [];
+  let customDnsLookupMock: ((hostname: string) => Promise<Array<{ address: string; family: number }>>) | null = null;
+  let insideTlsWrapper = false;
+
+  (dns.promises as any).lookup = async function (hostname: string, options?: any) {
+    if (customDnsLookupMock) {
+      return customDnsLookupMock(hostname);
+    }
+    return (origDnsLookup as any).call(dns.promises, hostname, options);
+  };
+
+  (net as any).connect = function (...args: any[]) {
+    const first = args[0];
+    if (first && typeof first === 'object' && !insideTlsWrapper) {
+      const targetPort = Number(first.port);
+      const targetHost = String(first.host || '');
+      if (!ignoredTestHttpPorts.has(targetPort)) {
+        socketConnectEvents.push({
+          transport: 'tcp',
+          host: targetHost,
+          port: targetPort,
+          family: first.family,
+        });
+        if (mockRoutedLanIps.has(targetHost) && targetPort === routerPort) {
+          const rewritten = { ...first, host: '127.0.0.1' };
+          return (origNetConnect as any).call(net, rewritten, ...args.slice(1));
+        }
+        // Blokir upaya koneksi TCP ke alamat lain dari test agar tidak pernah menyentuh jaringan eksternal
+        if (targetHost !== '127.0.0.1') {
+          throw Object.assign(new Error(`Blocked unexpected outbound test socket to ${targetHost}:${targetPort}`), {
+            code: 'ECONNREFUSED',
+          });
+        }
+      }
+    }
+    return (origNetConnect as any).apply(net, args);
+  };
+
+  (tls as any).connect = function (...args: any[]) {
+    const first = args[0];
+    if (first && typeof first === 'object') {
+      const targetPort = Number(first.port);
+      const targetHost = String(first.host || '');
+      if (!ignoredTestHttpPorts.has(targetPort)) {
+        socketConnectEvents.push({
+          transport: 'tls',
+          host: targetHost,
+          port: targetPort,
+          family: first.family,
+        });
+        if (!mockRoutedLanIps.has(targetHost) || targetPort !== routerPort) {
+          throw Object.assign(new Error(`Blocked unexpected outbound TLS test socket to ${targetHost}:${targetPort}`), {
+            code: 'ECONNREFUSED',
+          });
+        }
+        insideTlsWrapper = true;
+        try {
+          const rewritten = { ...first, host: '127.0.0.1' };
+          return (origTlsConnect as any).call(tls, rewritten, ...args.slice(1));
+        } finally {
+          insideTlsWrapper = false;
+        }
+      }
+    }
+    return (origTlsConnect as any).apply(tls, args);
+  };
 
   (pg.Pool.prototype as any).query = async function (text: string, params?: any[]) {
     return dbStore.handleQuery(text, params);
@@ -858,7 +989,11 @@ async function main() {
 
   const { encryptMikrotikPassword, decryptMikrotikPassword } = await import('../cryptoUtils.js');
   const {
+    validateRouterHost,
+    resolveAndValidateRouterHost,
+    validateRouterPort,
     testMikrotikConnection,
+    withRouterOsClient,
     disconnectPppoeSession,
     disconnectHotspotSession,
     createOrUpdatePppoeSecret,
@@ -898,7 +1033,9 @@ async function main() {
 
   const httpServer = http.createServer(app);
   await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
-  const baseUrl = `http://127.0.0.1:${(httpServer.address() as net.AddressInfo).port}/api`;
+  const httpPort = (httpServer.address() as net.AddressInfo).port;
+  ignoredTestHttpPorts.add(httpPort);
+  const baseUrl = `http://127.0.0.1:${httpPort}/api`;
 
   async function api(method: string, path: string, body?: any): Promise<{ status: number; json: any; rawText: string }> {
     const res = await fetch(`${baseUrl}${path}`, {
@@ -943,6 +1080,9 @@ async function main() {
     } catch (err: any) {
       failed++;
       console.error(`[FAIL] Skenario ${no}: ${name} -> ${err?.message || err}`);
+      if (err?.stack) {
+        console.error(err.stack);
+      }
     }
   }
 
@@ -1440,7 +1580,7 @@ async function main() {
     mockRouter.pppoeActives.push({ '.id': '*LINGER1', name: 'rina17' });
     mockRouter.lingerAfterRemoveIds.add('*LINGER1');
     const dcRes = await disconnectPppoeSession(
-      { host: '127.0.0.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
+      { host: '192.168.88.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
       'rina17'
     );
     assert.equal(dcRes.success, false, 'Harus gagal jika sesi masih tersisa saat verifikasi /print pasca-remove!');
@@ -1449,7 +1589,7 @@ async function main() {
     mockRouter.hotspotActives.push({ '.id': '*HLINGER', user: 'rina_hs' });
     mockRouter.lingerAfterRemoveIds.add('*HLINGER');
     const hsDcRes = await disconnectHotspotSession(
-      { host: '127.0.0.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
+      { host: '192.168.88.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
       'rina_hs'
     );
     assert.equal(hsDcRes.success, false);
@@ -1459,7 +1599,7 @@ async function main() {
     await assert.rejects(
       () =>
         createOrUpdatePppoeSecret(
-          { host: '127.0.0.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
+          { host: '192.168.88.1', port: routerPort, username: 'admin', password: 'router_secret_123', timeoutSeconds: 5 },
           { username: 'rina17', password: 'Password17', profile: 'prof-pppoe-10m' }
         ),
       /duplikat/i
@@ -1854,7 +1994,7 @@ async function main() {
   // Skenario 30: Ketahanan socket lifecycle (/quit bersih, offline, !fatal, mid-command ECONNRESET, dan timeout) tanpa unhandled error
   await runScenario(30, 'Ketahanan socket lifecycle: /quit, offline, !fatal, mid-command TCP reset (ECONNRESET), dan timeout tertangani bersih', async () => {
     const connOpts = {
-      host: '127.0.0.1',
+      host: '192.168.88.1',
       port: routerPort,
       username: 'admin',
       password: 'router_secret_123',
@@ -2265,7 +2405,9 @@ async function main() {
     injectedApp.use('/api', injectedRouter);
     const injectedServer = http.createServer(injectedApp);
     await new Promise<void>((resolve) => injectedServer.listen(0, '127.0.0.1', () => resolve()));
-    const injectedBase = `http://127.0.0.1:${(injectedServer.address() as net.AddressInfo).port}/api`;
+    const injectedHttpPort = (injectedServer.address() as net.AddressInfo).port;
+    ignoredTestHttpPorts.add(injectedHttpPort);
+    const injectedBase = `http://127.0.0.1:${injectedHttpPort}/api`;
 
     const apiInjected = async (method: string, path: string, body?: any) => {
       const res = await fetch(`${injectedBase}${path}`, {
@@ -3450,9 +3592,378 @@ async function main() {
     assert.equal(mockRouter.commandLog.length, 0, 'PUT saat prevPending.corrupted tidak boleh menjalankan perintah RouterOS');
   });
 
+  // Skenario 52: Validasi Host MikroTik (RFC1918, anti-loopback/link-local/multicast/publik/IPv6/IPv4-mapped IPv6, DNS & anti-rebinding)
+  await runScenario(52, 'Validasi host MikroTik ketat: RFC1918, tolak publik/loopback/link-local/multicast/IPv6-mapped, validasi DNS, & anti-DNS-rebinding', async () => {
+    // 1. Alamat IP privat RFC1918 diterima & dapat dikonfigurasi (tidak terkunci ke 10.10.20.1)
+    const allowedPrivateIps = [
+      '10.0.0.1',
+      '10.10.20.1',
+      '10.255.255.254',
+      '172.16.0.1',
+      '172.20.5.10',
+      '172.31.255.254',
+      '192.168.0.1',
+      '192.168.88.1',
+      '192.168.255.254',
+    ];
+    for (const ip of allowedPrivateIps) {
+      assert.equal(validateRouterHost(ip), ip, `IP privat RFC1918 ${ip} wajib diterima`);
+      const resolved = await resolveAndValidateRouterHost(ip);
+      assert.equal(resolved.resolvedIp, ip);
+      assert.equal(resolved.isIpLiteral, true);
+    }
+
+    // Uji koneksi nyata ke berbagai IP LAN RFC1918 (bukan hanya 10.10.20.1)
+    for (const lanIp of ['10.20.30.1', '172.16.10.1', '192.168.88.1']) {
+      const resConn = await testMikrotikConnection({
+        host: lanIp,
+        port: routerPort,
+        username: 'admin',
+        password: 'router_secret_123',
+        timeoutSeconds: 3,
+      });
+      assert.equal(resConn.success, true, `Router LAN ${lanIp} wajib dapat diuji koneksinya`);
+    }
+
+    // 2. Tolak IP publik, batas luar RFC1918, CGNAT, loopback, link-local, multicast, unspecified, broadcast, & khusus
+    const blockedHosts = [
+      // IP publik & batas luar RFC1918
+      '8.8.8.8',
+      '1.1.1.1',
+      '9.255.255.255',
+      '11.0.0.1',
+      '172.15.255.255',
+      '172.32.0.1',
+      '192.167.255.255',
+      '192.169.0.1',
+      '100.64.0.1',
+      '100.100.100.200',
+      // Loopback
+      '127.0.0.1',
+      '127.0.1.1',
+      '127.255.255.254',
+      'localhost',
+      'api.localhost',
+      'localhost.localdomain',
+      // Link-local & cloud metadata
+      '169.254.0.1',
+      '169.254.169.254',
+      'metadata.google.internal',
+      'metadata.internal',
+      // Unspecified, multicast, broadcast, test-net, benchmarking
+      '0.0.0.0',
+      '0.10.0.1',
+      '224.0.0.1',
+      '239.255.255.250',
+      '240.0.0.1',
+      '255.255.255.255',
+      '192.0.2.1',
+      '198.18.0.1',
+      '203.0.113.1',
+      // Notasi tersamar / non-kanonis (integer, hex, oktal, shorthand, embedded port/userinfo)
+      '2130706433',
+      '0x7f000001',
+      '0177.0.0.1',
+      '127.1',
+      '10.1',
+      '192.168.88.1:8728',
+      'http://192.168.88.1',
+      // IPv6 termasuk loopback, link-local, multicast, unspecified, ULA metadata, global, & IPv4-mapped IPv6
+      '::1',
+      '[::1]',
+      '::',
+      'fe80::1',
+      'fe80::1%eth0',
+      'ff02::1',
+      'fd00:ec2::254',
+      '2001:4860:4860::8888',
+      '::ffff:127.0.0.1',
+      '[::ffff:127.0.0.1]',
+      '::ffff:169.254.169.254',
+      '::ffff:8.8.8.8',
+      '::ffff:192.168.1.1',
+      '::ffff:7f00:1',
+      '0:0:0:0:0:ffff:c0a8:0101',
+      '::192.168.1.1',
+    ];
+
+    for (const badHost of blockedHosts) {
+      assert.throws(() => validateRouterHost(badHost), /VALIDATION_ERROR|ditolak|terlarang|tidak valid|tidak diizinkan/i, `Host terlarang '${badHost}' wajib ditolak`);
+      socketConnectEvents.length = 0;
+      await assert.rejects(
+        () =>
+          testMikrotikConnection({
+            host: badHost,
+            port: routerPort,
+            username: 'admin',
+            password: 'router_secret_123',
+            timeoutSeconds: 3,
+          }),
+        /VALIDATION_ERROR|ditolak|terlarang|tidak valid|tidak diizinkan/i
+      );
+      assert.equal(socketConnectEvents.length, 0, `Host terlarang '${badHost}' tidak boleh memicu koneksi TCP/TLS`);
+    }
+
+    // 3. Validasi DNS: Hostname mengarah ke IP publik ditolak (0 koneksi TCP/TLS)
+    customDnsLookupMock = async () => [{ address: '8.8.8.8', family: 4 }];
+    socketConnectEvents.length = 0;
+    await assert.rejects(
+      () => resolveAndValidateRouterHost('router-publik.example'),
+      /tidak diizinkan|IP publik/i
+    );
+    await assert.rejects(
+      () =>
+        testMikrotikConnection({
+          host: 'router-publik.example',
+          port: routerPort,
+          username: 'admin',
+          password: 'router_secret_123',
+        }),
+      /tidak diizinkan|IP publik/i
+    );
+    assert.equal(socketConnectEvents.length, 0, 'Hostname menuju IP publik tidak boleh memicu koneksi TCP/TLS');
+
+    // 4. Validasi DNS: Hostname hasil campuran privat + publik ditolak (0 koneksi TCP/TLS)
+    customDnsLookupMock = async () => [
+      { address: '192.168.88.1', family: 4 },
+      { address: '8.8.8.8', family: 4 },
+    ];
+    socketConnectEvents.length = 0;
+    await assert.rejects(
+      () =>
+        testMikrotikConnection({
+          host: 'mixed-dns.lan',
+          port: routerPort,
+          username: 'admin',
+          password: 'router_secret_123',
+        }),
+      /tidak diizinkan|IP publik/i
+    );
+    assert.equal(socketConnectEvents.length, 0, 'Hostname campuran privat+publik tidak boleh memicu koneksi TCP/TLS');
+
+    // Campuran privat + IPv4-mapped IPv6 juga ditolak
+    customDnsLookupMock = async () => [
+      { address: '10.10.20.1', family: 4 },
+      { address: '::ffff:127.0.0.1', family: 6 },
+    ];
+    await assert.rejects(
+      () => resolveAndValidateRouterHost('mixed-v6.lan'),
+      /IPv4-mapped|tidak diizinkan/i
+    );
+
+    // 5. Anti-DNS Rebinding: lookup #1 mengembalikan 10.10.20.1, lookup berikutnya berubah ke 127.0.0.1 / 8.8.8.8
+    // Koneksi HARUS tetap diarahkan hanya ke 10.10.20.1 (IP tervalidasi) dan tidak melakukan lookup ke-2 saat connect
+    let dnsCallCount = 0;
+    customDnsLookupMock = async () => {
+      dnsCallCount++;
+      if (dnsCallCount === 1) {
+        return [{ address: '10.10.20.1', family: 4 }];
+      }
+      return [{ address: '8.8.8.8', family: 4 }];
+    };
+    socketConnectEvents.length = 0;
+    const rebindTestRes = await testMikrotikConnection({
+      host: 'rebind-router.lan',
+      port: routerPort,
+      username: 'admin',
+      password: 'router_secret_123',
+      timeoutSeconds: 3,
+    });
+    assert.equal(rebindTestRes.success, true);
+    assert.equal(dnsCallCount, 1, 'DNS hanya boleh diresolusi satu kali saat validasi sebelum socket connect');
+    assert.equal(socketConnectEvents.length, 1);
+    assert.equal(socketConnectEvents[0].host, '10.10.20.1', 'Socket wajib terhubung ke IP tervalidasi, bukan hasil rebind 8.8.8.8');
+
+    // Uji juga withRouterOsClient terhadap DNS rebinding (lookup #1 valid 10.20.30.1, selanjutnya 127.0.0.1)
+    dnsCallCount = 0;
+    customDnsLookupMock = async () => {
+      dnsCallCount++;
+      if (dnsCallCount === 1) {
+        return [{ address: '10.20.30.1', family: 4 }];
+      }
+      return [{ address: '127.0.0.1', family: 4 }];
+    };
+    socketConnectEvents.length = 0;
+    const clientTalkRes = await withRouterOsClient(
+      {
+        host: 'rebind-client.lan',
+        port: routerPort,
+        username: 'admin',
+        password: 'router_secret_123',
+        timeoutSeconds: 3,
+      },
+      async (talk) => talk(['/system/identity/print'])
+    );
+    assert.ok(Array.isArray(clientTalkRes));
+    assert.equal(dnsCallCount, 1);
+    assert.equal(socketConnectEvents.length, 1);
+    assert.equal(socketConnectEvents[0].host, '10.20.30.1');
+
+    // Validasi port ketat
+    assert.equal(validateRouterPort('8728'), 8728);
+    assert.throws(() => validateRouterPort('8728abc'));
+    assert.throws(() => validateRouterPort(0));
+    assert.throws(() => validateRouterPort(70000));
+
+    customDnsLookupMock = null;
+  });
+
+  // Skenario 53: Keamanan endpoint POST /api/mikrotik/test-connection & POST /api/mikrotik/config
+  await runScenario(53, 'Keamanan endpoint POST /api/mikrotik/test-connection: hanya router tersimpan, tolak override host/port body, 0 koneksi saat tidak valid, & zero secret leak', async () => {
+    const capturedLogs: string[] = [];
+    const origConsoleError = console.error;
+    console.error = (...args: any[]) => {
+      capturedLogs.push(args.map((a) => String(a)).join(' '));
+      origConsoleError(...args);
+    };
+
+    try {
+      // Beri jeda singkat agar penutupan soket graceful (/quit) dari skenario sebelumnya selesai diterima server mock
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      // 1. Jika konfigurasi router belum tersimpan di database -> tolak HTTP 400, 0 koneksi TCP/TLS, 0 perintah RouterOS
+      dbStore.routerConfigMissing = true;
+      socketConnectEvents.length = 0;
+      mockRouter.commandLog = [];
+      const connBeforeMissing = mockRouter.connectionCount;
+      const missingRes = await api('POST', '/mikrotik/test-connection', {
+        host: '192.168.88.1',
+        apiPort: routerPort,
+      });
+      assert.equal(missingRes.status, 400);
+      assert.equal(missingRes.json.success, false);
+      assert.equal(socketConnectEvents.length, 0);
+      assert.equal(mockRouter.connectionCount, connBeforeMissing);
+      assert.equal(mockRouter.commandLog.length, 0);
+      dbStore.routerConfigMissing = false;
+
+      // 2. Endpoint tidak bisa diarahkan ke host yang dikirim melalui request body (termasuk IP privat lain, publik, loopback, metadata, DNS)
+      const overrideHosts = [
+        '10.99.99.99',
+        '172.16.99.99',
+        '8.8.8.8',
+        '127.0.0.1',
+        '169.254.169.254',
+        'metadata.google.internal',
+        '::ffff:127.0.0.1',
+        'evil-target.example',
+      ];
+      for (const badTarget of overrideHosts) {
+        socketConnectEvents.length = 0;
+        mockRouter.commandLog = [];
+        const connBefore = mockRouter.connectionCount;
+        const overrideRes = await api('POST', '/mikrotik/test-connection', {
+          host: badTarget,
+        });
+        assert.equal(overrideRes.status, 400, `Override host '${badTarget}' wajib ditolak HTTP 400`);
+        assert.equal(overrideRes.json.success, false);
+        assert.equal(overrideRes.json.errorCode, 'VALIDATION_ERROR');
+        assert.equal(socketConnectEvents.length, 0, `Override host '${badTarget}' tidak boleh memicu soket TCP/TLS`);
+        assert.equal(mockRouter.connectionCount, connBefore);
+        assert.equal(mockRouter.commandLog.length, 0);
+        assert.ok(!overrideRes.rawText.includes('router_secret_123'));
+        assert.ok(!overrideRes.rawText.includes('enc:v1:'));
+      }
+
+      // 3. Endpoint tidak bisa diarahkan ke port / apiPort yang dikirim melalui request body
+      for (const portPayload of [{ apiPort: 22 }, { apiPort: 80 }, { port: 443 }, { apiPort: 99999 }, { apiPort: '22abc' }]) {
+        socketConnectEvents.length = 0;
+        mockRouter.commandLog = [];
+        const connBefore = mockRouter.connectionCount;
+        const portRes = await api('POST', '/mikrotik/test-connection', portPayload);
+        assert.equal(portRes.status, 400, `Override port ${JSON.stringify(portPayload)} wajib ditolak HTTP 400`);
+        assert.equal(portRes.json.success, false);
+        assert.equal(portRes.json.errorCode, 'VALIDATION_ERROR');
+        assert.equal(socketConnectEvents.length, 0);
+        assert.equal(mockRouter.connectionCount, connBefore);
+        assert.equal(mockRouter.commandLog.length, 0);
+      }
+
+      // 4. Jika host tersimpan di DB sendiri bernilai tidak valid/publik -> ditolak HTTP 400 sebelum dekripsi & tanpa koneksi TCP/TLS
+      dbStore.routerHost = '169.254.169.254';
+      socketConnectEvents.length = 0;
+      const badDbHostRes = await api('POST', '/mikrotik/test-connection', {});
+      assert.equal(badDbHostRes.status, 400);
+      assert.equal(badDbHostRes.json.success, false);
+      assert.equal(socketConnectEvents.length, 0);
+
+      // Kembalikan host DB ke valid
+      dbStore.routerHost = '192.168.88.1';
+
+      // 5. Mengubah IP, port, nama, dan model melalui alur pengaturan POST /api/mikrotik/config tetap berjalan normal
+      //    Sekaligus menolak penyimpanan host berbahaya di /api/mikrotik/config
+      const badSaveCfg = await api('POST', '/mikrotik/config', {
+        routerName: 'Bad Router',
+        host: '127.0.0.1',
+        apiPort: routerPort,
+        username: 'admin',
+      });
+      assert.equal(badSaveCfg.status, 400);
+      assert.equal(badSaveCfg.json.success, false);
+
+      const goodSaveCfg = await api('POST', '/mikrotik/config', {
+        routerName: 'RB4011 LAN Baru',
+        modelTarget: 'RB4011iGS+RM',
+        host: '10.10.20.1',
+        apiPort: routerPort,
+        username: 'admin',
+        useSsl: false,
+        timeoutSeconds: 5,
+      });
+      assert.equal(goodSaveCfg.status, 200);
+      assert.equal(goodSaveCfg.json.success, true);
+      assert.equal(dbStore.routerHost, '10.10.20.1');
+
+      // 6. Request valid (tanpa override maupun payload cocok dengan konfigurasi tersimpan) berhasil menguji router tersimpan
+      socketConnectEvents.length = 0;
+      const validEmptyRes = await api('POST', '/mikrotik/test-connection', {});
+      assert.equal(validEmptyRes.status, 200);
+      assert.equal(validEmptyRes.json.success, true);
+      assert.equal(validEmptyRes.json.data?.identity, 'MockRB4011');
+      assert.equal(socketConnectEvents.length, 1);
+      assert.equal(socketConnectEvents[0].host, '10.10.20.1');
+
+      socketConnectEvents.length = 0;
+      const validMatchingBodyRes = await api('POST', '/mikrotik/test-connection', {
+        host: '10.10.20.1',
+        apiPort: routerPort,
+        username: 'admin',
+        useSsl: false,
+      });
+      assert.equal(validMatchingBodyRes.status, 200);
+      assert.equal(validMatchingBodyRes.json.success, true);
+      assert.equal(socketConnectEvents.length, 1);
+      assert.equal(socketConnectEvents[0].host, '10.10.20.1');
+
+      // 7. Pastikan password, ciphertext enc:v1, dan detail rahasia tidak pernah muncul di respons maupun log
+      const allOutputs = [
+        missingRes.rawText,
+        badSaveCfg.rawText,
+        goodSaveCfg.rawText,
+        validEmptyRes.rawText,
+        validMatchingBodyRes.rawText,
+        ...capturedLogs,
+      ];
+      for (const text of allOutputs) {
+        assert.ok(!text.includes('router_secret_123'), 'Password router tidak boleh muncul pada respons atau log!');
+        assert.ok(!/enc:v1:[0-9a-fA-F:]+/.test(text), 'Ciphertext enc:v1 tidak boleh muncul pada respons atau log!');
+        assert.ok(!text.includes('password_encrypted'), 'Nama kolom rahasia tidak boleh bocor!');
+      }
+
+      // Reset kembali konfigurasi ke kondisi default untuk kebersihan
+      dbStore.reset(routerPort, routerPasswordEnc);
+    } finally {
+      console.error = origConsoleError;
+      customDnsLookupMock = null;
+    }
+  });
+
   // Restore prototypes & stop servers cleanly
   pg.Pool.prototype.query = origQuery;
   pg.Pool.prototype.connect = origConnect;
+  (net as any).connect = origNetConnect;
+  (tls as any).connect = origTlsConnect;
+  (dns.promises as any).lookup = origDnsLookup;
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   await mockRouter.stop();
 

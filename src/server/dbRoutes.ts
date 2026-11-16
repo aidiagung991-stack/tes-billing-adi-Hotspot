@@ -10,6 +10,7 @@ import {
 import {
   testMikrotikConnection,
   validateRouterHost,
+  resolveAndValidateRouterHost,
   validateRouterPort,
   checkProfileExists,
   createOrUpdatePppoeSecret,
@@ -596,15 +597,20 @@ async function getActiveRouterOptions(): Promise<MikrotikConnectionOptions | nul
     );
     if (!res.rows || res.rows.length === 0) return null;
     const row = res.rows[0];
+    if (!row.host || typeof row.host !== 'string' || !row.host.trim()) return null;
     const encryptedPassword = row.password_encrypted || row.password_hash;
     if (!encryptedPassword) return null;
     if (!isMikrotikEncryptionKeyConfigured()) return null;
 
-    const rawPassword = decryptMikrotikPassword(encryptedPassword);
+    // Validasi host (termasuk resolusi DNS) dan port SEBELUM mendekripsi password tersimpan
     const useSsl = Boolean(row.use_ssl);
+    const validatedPort = validateRouterPort(row.api_port ?? (useSsl ? 8729 : 8728));
+    const validatedTarget = await resolveAndValidateRouterHost(row.host);
+    const rawPassword = decryptMikrotikPassword(encryptedPassword);
+
     return {
-      host: validateRouterHost(row.host || '192.168.88.1'),
-      port: validateRouterPort(row.api_port ?? (useSsl ? 8729 : 8728)),
+      host: validatedTarget.host,
+      port: validatedPort,
       username: (row.username || 'admin').trim(),
       password: rawPassword,
       useSsl,
@@ -3431,12 +3437,18 @@ router.post('/mikrotik/config', async (req: Request, res: Response) => {
       notes,
     } = req.body;
 
-    // Validasi host dan port (mencegah SSRF & menjamin input valid)
-    const cleanHost = validateRouterHost(host || '192.168.88.1');
+    // Validasi host (termasuk resolusi DNS bila berupa hostname) dan port untuk mencegah SSRF
+    const hostCandidate = host === undefined ? '192.168.88.1' : host;
+    const validatedTarget = await resolveAndValidateRouterHost(hostCandidate);
+    const cleanHost = validatedTarget.host;
     const cleanPort = validateRouterPort(apiPort ?? (useSsl ? 8729 : 8728));
     const cleanUsername = (username || 'admin').trim();
     if (!cleanUsername) {
-      return res.status(400).json({ success: false, message: 'Username API MikroTik tidak boleh kosong.' });
+      return res.status(400).json({
+        success: false,
+        errorCode: 'VALIDATION_ERROR',
+        message: 'Username API MikroTik tidak boleh kosong.',
+      });
     }
 
     // Periksa password_encrypted yang sudah ada di database backend
@@ -3513,70 +3525,144 @@ router.post('/mikrotik/config', async (req: Request, res: Response) => {
   }
 });
 
-// Endpoint pengujian koneksi RouterOS API nyata
+// Endpoint pengujian koneksi RouterOS API nyata (khusus router yang sudah tersimpan di DB)
 router.post('/mikrotik/test-connection', async (req: Request, res: Response) => {
   try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
     const {
       host: bodyHost,
       apiPort: bodyApiPort,
+      port: bodyPortAlias,
       username: bodyUsername,
-      password: bodyPassword,
       useSsl: bodyUseSsl,
-      timeoutSeconds: bodyTimeoutSeconds,
-    } = req.body || {};
+    } = body as Record<string, unknown>;
 
-    // Ambil konfigurasi tersimpan dari database
+    // 1. Ambil konfigurasi router yang sudah tersimpan dan terkonfigurasi di database
     const savedConfigRes = await query(
       `SELECT host, api_port, username, password_encrypted, password_hash, use_ssl, timeout_seconds, ros_version_preview
        FROM mikrotik_settings WHERE id = 'default' LIMIT 1`
     );
-    const dbRow = savedConfigRes.rows[0] || {};
+    if (!savedConfigRes.rows || savedConfigRes.rows.length === 0) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Konfigurasi router MikroTik belum tersimpan di database. Simpan konfigurasi router terlebih dahulu sebelum menguji koneksi.',
+        { statusCode: 400 }
+      );
+    }
 
-    const targetHost = validateRouterHost(bodyHost || dbRow.host || '192.168.88.1');
-    const targetUseSsl = bodyUseSsl !== undefined ? Boolean(bodyUseSsl) : Boolean(dbRow.use_ssl);
-    const targetPort = validateRouterPort(bodyApiPort ?? dbRow.api_port ?? (targetUseSsl ? 8729 : 8728));
-    const targetUsername = (bodyUsername || dbRow.username || 'admin').trim();
-    const targetTimeout = Math.max(3, Math.min(30, Number(bodyTimeoutSeconds ?? dbRow.timeout_seconds ?? 10)));
+    const dbRow = savedConfigRes.rows[0];
+    if (!dbRow.host || typeof dbRow.host !== 'string' || !dbRow.host.trim()) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Alamat host router MikroTik belum dikonfigurasi di database.',
+        { statusCode: 400 }
+      );
+    }
 
-    // Tentukan password untuk pengujian
-    let rawPassword = '';
-    if (bodyPassword && bodyPassword !== '••••••••' && bodyPassword.trim() !== '') {
-      rawPassword = bodyPassword.trim();
-    } else {
-      const encryptedStored = dbRow.password_encrypted || dbRow.password_hash;
-      if (!encryptedStored) {
-        return res.status(400).json({
-          success: false,
-          message: 'Password akun API MikroTik belum dikonfigurasi. Masukkan password terlebih dahulu.',
-        });
+    const savedRawHost = dbRow.host.trim();
+    const savedUseSsl = Boolean(dbRow.use_ssl);
+    const savedPort = validateRouterPort(dbRow.api_port ?? (savedUseSsl ? 8729 : 8728));
+    const savedUsername = (dbRow.username || 'admin').trim();
+    const savedTimeout = Math.max(3, Math.min(30, Number(dbRow.timeout_seconds ?? 10)));
+
+    // 2. Tolak segala upaya mengarahkan pengujian ke host, port, mode SSL, atau akun berbeda via request body
+    if (bodyHost !== undefined && bodyHost !== null) {
+      if (typeof bodyHost !== 'string') {
+        throw new SafeOperationalError(
+          'VALIDATION_ERROR',
+          'Parameter host pada permintaan pengujian tidak valid.',
+          { statusCode: 400 }
+        );
       }
-
-      if (!isMikrotikEncryptionKeyConfigured()) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Kunci enkripsi MIKROTIK_ENCRYPTION_KEY belum dikonfigurasi di file .env server. Password tersimpan tidak dapat didekripsi.',
-        });
-      }
-
-      try {
-        rawPassword = decryptMikrotikPassword(encryptedStored);
-      } catch {
-        return res.status(500).json({
-          success: false,
-          message: 'Gagal mendeskripsi password router dari database. Periksa kesesuaian MIKROTIK_ENCRYPTION_KEY.',
-        });
+      const trimmedBodyHost = bodyHost.trim();
+      if (trimmedBodyHost !== '' && trimmedBodyHost.toLowerCase() !== savedRawHost.toLowerCase()) {
+        throw new SafeOperationalError(
+          'VALIDATION_ERROR',
+          'Pengujian koneksi hanya diperbolehkan terhadap host router yang sudah tersimpan di database. Simpan perubahan konfigurasi terlebih dahulu.',
+          { statusCode: 400 }
+        );
       }
     }
 
-    // Eksekusi koneksi RouterOS API nyata
+    const requestedPortRaw =
+      bodyApiPort !== undefined && bodyApiPort !== null && String(bodyApiPort).trim() !== ''
+        ? bodyApiPort
+        : bodyPortAlias !== undefined && bodyPortAlias !== null && String(bodyPortAlias).trim() !== ''
+        ? bodyPortAlias
+        : undefined;
+
+    if (requestedPortRaw !== undefined) {
+      const validatedBodyPort = validateRouterPort(requestedPortRaw as any);
+      if (validatedBodyPort !== savedPort) {
+        throw new SafeOperationalError(
+          'VALIDATION_ERROR',
+          'Pengujian koneksi hanya diperbolehkan terhadap port API router yang sudah tersimpan di database. Simpan perubahan konfigurasi terlebih dahulu.',
+          { statusCode: 400 }
+        );
+      }
+    }
+
+    if (bodyUseSsl !== undefined && bodyUseSsl !== null && Boolean(bodyUseSsl) !== savedUseSsl) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Pengujian koneksi hanya diperbolehkan sesuai pengaturan SSL yang tersimpan. Simpan perubahan konfigurasi terlebih dahulu.',
+        { statusCode: 400 }
+      );
+    }
+
+    if (bodyUsername !== undefined && bodyUsername !== null) {
+      if (typeof bodyUsername !== 'string') {
+        throw new SafeOperationalError('VALIDATION_ERROR', 'Parameter username tidak valid.', { statusCode: 400 });
+      }
+      if (bodyUsername.trim() !== '' && bodyUsername.trim() !== savedUsername) {
+        throw new SafeOperationalError(
+          'VALIDATION_ERROR',
+          'Pengujian koneksi hanya diperbolehkan menggunakan username router yang sudah tersimpan. Simpan perubahan konfigurasi terlebih dahulu.',
+          { statusCode: 400 }
+        );
+      }
+    }
+
+    // 3. Validasi host tersimpan (RFC1918, anti-loopback/link-local/publik/IPv6/DNS) SEBELUM dekripsi password
+    const validatedTarget = await resolveAndValidateRouterHost(savedRawHost);
+
+    // 4. Dekripsi password router hanya setelah target tersimpan dipastikan lolos validasi
+    const encryptedStored = dbRow.password_encrypted || dbRow.password_hash;
+    if (!encryptedStored) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Password akun API MikroTik belum dikonfigurasi pada pengaturan router. Simpan password terlebih dahulu.',
+        { statusCode: 400 }
+      );
+    }
+
+    if (!isMikrotikEncryptionKeyConfigured()) {
+      throw new SafeOperationalError(
+        'ENCRYPTION_NOT_CONFIGURED',
+        'Kunci enkripsi MIKROTIK_ENCRYPTION_KEY belum dikonfigurasi di file .env server. Password tersimpan tidak dapat didekripsi.',
+        { statusCode: 400 }
+      );
+    }
+
+    let rawPassword = '';
+    try {
+      rawPassword = decryptMikrotikPassword(encryptedStored);
+    } catch {
+      throw new SafeOperationalError(
+        'DECRYPTION_ERROR',
+        'Gagal mendekripsi password router dari database. Periksa kesesuaian MIKROTIK_ENCRYPTION_KEY.',
+        { statusCode: 500 }
+      );
+    }
+
+    // 5. Eksekusi koneksi RouterOS API nyata hanya menuju konfigurasi tersimpan yang sudah divalidasi
     const result = await mtDeps.testMikrotikConnection({
-      host: targetHost,
-      port: targetPort,
-      username: targetUsername,
+      host: validatedTarget.host,
+      port: savedPort,
+      username: savedUsername,
       password: rawPassword,
-      useSsl: targetUseSsl,
-      timeoutSeconds: targetTimeout,
+      useSsl: savedUseSsl,
+      timeoutSeconds: savedTimeout,
     });
 
     if (result.success) {

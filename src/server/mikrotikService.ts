@@ -1,5 +1,6 @@
 import net from 'net';
 import tls from 'tls';
+import dns from 'dns';
 import crypto from 'crypto';
 import {
   SafeOperationalError,
@@ -34,10 +35,225 @@ export interface MikrotikConnectionResult {
   errorDetails?: string;
 }
 
+export interface ValidatedRouterTarget {
+  host: string;
+  resolvedIp: string;
+  allResolvedIps: string[];
+  isIpLiteral: boolean;
+}
+
+const BLOCKED_EXACT_HOSTNAMES = new Set([
+  'localhost',
+  'localhost.localdomain',
+  'ip6-localhost',
+  'ip6-loopback',
+  'broadcasthost',
+  'metadata.google.internal',
+  'metadata.internal',
+  'instance-data',
+]);
+
+function parseCanonicalIpv4Octets(ip: string): [number, number, number, number] | null {
+  if (!net.isIPv4(ip)) return null;
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(part)) {
+      return null;
+    }
+    const val = Number(part);
+    if (!Number.isInteger(val) || val < 0 || val > 255) {
+      return null;
+    }
+    octets.push(val);
+  }
+  return [octets[0], octets[1], octets[2], octets[3]];
+}
+
+function ipv4OctetsToUint32(octets: [number, number, number, number]): number {
+  return ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+}
+
+function isIpv4InCidr(ipUint32: number, networkUint32: number, prefixLen: number): boolean {
+  const mask = prefixLen === 0 ? 0 : (~0 << (32 - prefixLen)) >>> 0;
+  return ((ipUint32 & mask) >>> 0) === ((networkUint32 & mask) >>> 0);
+}
+
 /**
- * Validasi alamat Host / IP RouterOS untuk mencegah SSRF.
- * Mengizinkan alamat IP privat LAN (192.168.x.x, 10.x.x.x, 172.16-31.x.x), loopback lokal, dan hostname lokal.
- * Menolak alamat cloud metadata (169.254.x.x, metadata.google.internal, dsb).
+ * Klasifikasi biner alamat IPv4 berdasarkan rentang CIDR (tanpa mengandalkan pencocokan string).
+ * Allowlist: HANYA RFC1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+ */
+function classifyIpv4Address(ip: string): { allowed: boolean; reason: string } {
+  const octets = parseCanonicalIpv4Octets(ip);
+  if (!octets) {
+    return { allowed: false, reason: 'format IPv4 tidak valid atau tidak kanonis' };
+  }
+  const u32 = ipv4OctetsToUint32(octets);
+
+  // Alamat khusus/berisiko yang wajib ditolak secara eksplisit
+  if (isIpv4InCidr(u32, 0x00000000, 8)) {
+    return { allowed: false, reason: 'alamat unspecified (0.0.0.0/8) tidak diizinkan' };
+  }
+  if (isIpv4InCidr(u32, 0x7f000000, 8)) {
+    return { allowed: false, reason: 'alamat loopback (127.0.0.0/8) tidak diizinkan' };
+  }
+  if (isIpv4InCidr(u32, 0xa9fe0000, 16)) {
+    return { allowed: false, reason: 'alamat link-local / cloud metadata (169.254.0.0/16) tidak diizinkan' };
+  }
+  if (isIpv4InCidr(u32, 0x64400000, 10)) {
+    return { allowed: false, reason: 'alamat CGNAT/shared (100.64.0.0/10) tidak diizinkan' };
+  }
+  if (isIpv4InCidr(u32, 0xe0000000, 4)) {
+    return { allowed: false, reason: 'alamat multicast (224.0.0.0/4) tidak diizinkan' };
+  }
+  if (isIpv4InCidr(u32, 0xf0000000, 4)) {
+    return { allowed: false, reason: 'alamat reserved / broadcast (240.0.0.0/4) tidak diizinkan' };
+  }
+  if (
+    isIpv4InCidr(u32, 0xc0000000, 24) || // 192.0.0.0/24 IETF protocol
+    isIpv4InCidr(u32, 0xc0000200, 24) || // 192.0.2.0/24 TEST-NET-1
+    isIpv4InCidr(u32, 0xc6120000, 15) || // 198.18.0.0/15 Benchmarking
+    isIpv4InCidr(u32, 0xc6336400, 24) || // 198.51.100.0/24 TEST-NET-2
+    isIpv4InCidr(u32, 0xcb007100, 24)    // 203.0.113.0/24 TEST-NET-3
+  ) {
+    return { allowed: false, reason: 'alamat IP khusus (reserved/benchmark/test-net) tidak diizinkan' };
+  }
+
+  // Allowlist ketat RFC1918
+  const isRfc1918 =
+    isIpv4InCidr(u32, 0x0a000000, 8) ||  // 10.0.0.0/8
+    isIpv4InCidr(u32, 0xac100000, 12) || // 172.16.0.0/12
+    isIpv4InCidr(u32, 0xc0a80000, 16);   // 192.168.0.0/16
+
+  if (!isRfc1918) {
+    return { allowed: false, reason: 'alamat IP publik tidak diizinkan (hanya IP privat LAN RFC1918)' };
+  }
+
+  return { allowed: true, reason: 'RFC1918' };
+}
+
+/**
+ * Mengurai alamat IPv6 ke representasi 8 grup 16-bit (128-bit) secara biner
+ * sehingga bentuk terkompresi, huruf besar, maupun embedded IPv4 tidak dapat lolos.
+ */
+function parseIpv6ToGroups(rawIp: string): number[] | null {
+  const clean = rawIp.trim().toLowerCase();
+  if (!net.isIPv6(clean)) return null;
+
+  let working = clean;
+  // Jika bagian akhir berbentuk dotted-quad IPv4 (mis. ::ffff:192.168.1.1), konversi menjadi dua grup 16-bit
+  const lastColon = working.lastIndexOf(':');
+  if (lastColon !== -1 && working.slice(lastColon + 1).includes('.')) {
+    const ipv4Part = working.slice(lastColon + 1);
+    const octets = parseCanonicalIpv4Octets(ipv4Part);
+    if (!octets) return null;
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    working = `${working.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+
+  const halves = working.split('::');
+  if (halves.length > 2) return null;
+
+  const parseSegmentList = (segStr: string): number[] | null => {
+    if (!segStr) return [];
+    const parts = segStr.split(':');
+    const out: number[] = [];
+    for (const p of parts) {
+      if (!/^[0-9a-f]{1,4}$/.test(p)) return null;
+      out.push(parseInt(p, 16));
+    }
+    return out;
+  };
+
+  if (halves.length === 1) {
+    const groups = parseSegmentList(halves[0]);
+    return groups && groups.length === 8 ? groups : null;
+  }
+
+  const left = parseSegmentList(halves[0]);
+  const right = parseSegmentList(halves[1]);
+  if (!left || !right) return null;
+  const zeroFill = 8 - (left.length + right.length);
+  if (zeroFill < 1) return null;
+  return [...left, ...Array(zeroFill).fill(0), ...right];
+}
+
+/**
+ * Kebijakan allowlist IPv6 yang aman (fail-closed):
+ * Saat ini tidak ada rentang IPv6 yang diizinkan untuk koneksi RouterOS LAN;
+ * seluruh IPv6 (termasuk IPv4-mapped ::ffff:0:0/96, loopback ::1, unspecified ::,
+ * link-local fe80::/10, multicast ff00::/8, ULA fd00::/8 termasuk metadata IPv6, dan global 2000::/3) ditolak.
+ */
+function classifyIpv6Address(rawIp: string): { allowed: boolean; reason: string } {
+  const g = parseIpv6ToGroups(rawIp);
+  if (!g) {
+    return { allowed: false, reason: 'format alamat IPv6 tidak valid' };
+  }
+
+  const isAllZeroPrefix = g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0;
+
+  // Unspecified ::
+  if (isAllZeroPrefix && g[5] === 0 && g[6] === 0 && g[7] === 0) {
+    return { allowed: false, reason: 'alamat IPv6 unspecified (::) tidak diizinkan' };
+  }
+  // Loopback ::1
+  if (isAllZeroPrefix && g[5] === 0 && g[6] === 0 && g[7] === 1) {
+    return { allowed: false, reason: 'alamat IPv6 loopback (::1) tidak diizinkan' };
+  }
+  // IPv4-mapped IPv6 (::ffff:0:0/96) & IPv4-compatible (::/96) & IPv4-translated (::ffff:0:0:0/96)
+  if (
+    (isAllZeroPrefix && (g[5] === 0xffff || g[5] === 0)) ||
+    (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0xffff && g[5] === 0)
+  ) {
+    return { allowed: false, reason: 'alamat IPv4-mapped/compatible IPv6 tidak diizinkan demi mencegah bypass validasi' };
+  }
+  // Link-local fe80::/10
+  if ((g[0] & 0xffc0) === 0xfe80) {
+    return { allowed: false, reason: 'alamat IPv6 link-local (fe80::/10) tidak diizinkan' };
+  }
+  // Multicast ff00::/8
+  if ((g[0] & 0xff00) === 0xff00) {
+    return { allowed: false, reason: 'alamat IPv6 multicast (ff00::/8) tidak diizinkan' };
+  }
+  // Semua alamat IPv6 lainnya (termasuk ULA fc00::/7 dan global 2000::/3) tidak berada pada allowlist IPv6
+  return { allowed: false, reason: 'alamat IPv6 tidak diizinkan oleh kebijakan allowlist host router' };
+}
+
+function isObfuscatedNumericHost(cleanHost: string): boolean {
+  const labels = cleanHost.split('.');
+  if (labels.length === 0) return true;
+  // Tolak notasi integer desimal, heksadesimal (0x...), oktal (0177...), atau shorthand IPv4 (127.1)
+  if (labels.every((lbl) => /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(lbl))) {
+    return true;
+  }
+  const lastLabel = labels[labels.length - 1];
+  if (/^(?:0x[0-9a-f]+|[0-9]+)$/i.test(lastLabel)) {
+    return true;
+  }
+  return false;
+}
+
+function isValidRfc1123Hostname(cleanHost: string): boolean {
+  if (cleanHost.length < 1 || cleanHost.length > 253) return false;
+  if (cleanHost.startsWith('.') || cleanHost.endsWith('.')) return false;
+  const labels = cleanHost.split('.');
+  for (const label of labels) {
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Validasi alamat Host / IP RouterOS secara sinkron (tanpa resolusi DNS).
+ * - Mengizinkan IPv4 privat RFC1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+ * - Menolak IP publik, loopback, link-local, multicast, unspecified, broadcast, CGNAT, reserved,
+ *   seluruh IPv6 termasuk IPv4-mapped IPv6, serta hostname terlarang (localhost, metadata.*).
+ * - Untuk hostname yang lolos pemeriksaan sintaks awal, pemanggil koneksi wajib melanjutkan ke
+ *   `resolveAndValidateRouterHost()` guna memvalidasi seluruh hasil resolusi DNS & mencegah DNS rebinding.
  */
 export function validateRouterHost(host: string): string {
   if (!host || typeof host !== 'string') {
@@ -46,10 +262,17 @@ export function validateRouterHost(host: string): string {
     });
   }
 
-  const cleanHost = host.trim().toLowerCase();
+  const trimmed = host.trim();
+  if (!trimmed || /[\x00-\x20\x7F/?#@%\\]/.test(trimmed)) {
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Format alamat Host / IP router mengandung karakter yang tidak valid.',
+      { statusCode: 400 }
+    );
+  }
 
   // Larang skema protokol URL seperti http:// atau https://
-  if (cleanHost.includes('://')) {
+  if (trimmed.includes('://')) {
     throw new SafeOperationalError(
       'VALIDATION_ERROR',
       'Masukkan alamat IP atau Hostname router saja, tanpa awalan protokol seperti http:// atau https://.',
@@ -57,27 +280,87 @@ export function validateRouterHost(host: string): string {
     );
   }
 
-  // Larang cloud metadata endpoints (SSRF protection)
-  if (
-    cleanHost === '169.254.169.254' ||
-    cleanHost.startsWith('169.254.') ||
-    cleanHost.includes('metadata.google.internal') ||
-    cleanHost.includes('metadata.internal') ||
-    cleanHost === '100.100.100.200'
-  ) {
+  let cleanHost = trimmed.toLowerCase();
+
+  // Tangani bentuk IPv6 berkurung siku seperti [::1] atau [::ffff:127.0.0.1]
+  if (cleanHost.startsWith('[') || cleanHost.endsWith(']')) {
+    if (!cleanHost.startsWith('[') || !cleanHost.endsWith(']')) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Format alamat Host / IP router tidak valid.',
+        { statusCode: 400 }
+      );
+    }
+    const unwrapped = cleanHost.slice(1, -1);
+    const v6Check = classifyIpv6Address(unwrapped);
     throw new SafeOperationalError(
       'VALIDATION_ERROR',
-      'Alamat IP tersebut terlarang demi keamanan server (Cloud Metadata Endpoint).',
+      `Alamat host router ditolak: ${v6Check.reason}.`,
       { statusCode: 400 }
     );
   }
 
-  // Pastikan karakter host hanya karakter valid (alfanumerik, titik, tanda hubung, atau kolon IPv6)
-  const validHostRegex = /^[a-zA-Z0-9.:_-]+$/;
-  if (!validHostRegex.test(cleanHost)) {
+  // Jika input adalah literal IPv6 (tanpa kurung siku)
+  if (net.isIPv6(cleanHost)) {
+    const v6Check = classifyIpv6Address(cleanHost);
+    if (!v6Check.allowed) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        `Alamat host router ditolak: ${v6Check.reason}.`,
+        { statusCode: 400 }
+      );
+    }
+    return cleanHost;
+  }
+
+  // Tolak penggunaan ':' selain IPv6 (mis. penyisipan port di dalam host)
+  if (cleanHost.includes(':')) {
     throw new SafeOperationalError(
       'VALIDATION_ERROR',
-      'Format alamat Host / IP router mengandung karakter yang tidak valid.',
+      'Alamat host router tidak boleh menyertakan port secara langsung atau format IPv6 tidak valid.',
+      { statusCode: 400 }
+    );
+  }
+
+  // Jika input berbentuk IPv4 literal (termasuk deteksi oktal/non-kanonis via isIPv4 / dots)
+  if (net.isIPv4(cleanHost)) {
+    const v4Check = classifyIpv4Address(cleanHost);
+    if (!v4Check.allowed) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        `Alamat IP router ditolak: ${v4Check.reason}.`,
+        { statusCode: 400 }
+      );
+    }
+    return cleanHost;
+  }
+
+  // Tolak notasi IPv4 tersamar (desimal tunggal, heksadesimal 0x..., oktal 0177.0.0.1, shorthand 127.1)
+  if (isObfuscatedNumericHost(cleanHost)) {
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Format alamat IP router tidak kanonis atau tidak valid. Gunakan format IPv4 privat RFC1918 standar (mis. 192.168.88.1).',
+      { statusCode: 400 }
+    );
+  }
+
+  // Tolak hostname loopback dan cloud metadata yang diketahui berbahaya
+  if (
+    BLOCKED_EXACT_HOSTNAMES.has(cleanHost) ||
+    cleanHost.endsWith('.localhost') ||
+    cleanHost.endsWith('.metadata.internal')
+  ) {
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Hostname loopback atau metadata cloud terlarang demi keamanan server.',
+      { statusCode: 400 }
+    );
+  }
+
+  if (!isValidRfc1123Hostname(cleanHost)) {
+    throw new SafeOperationalError(
+      'VALIDATION_ERROR',
+      'Format Hostname / IP router tidak valid.',
       { statusCode: 400 }
     );
   }
@@ -86,12 +369,118 @@ export function validateRouterHost(host: string): string {
 }
 
 /**
+ * Validasi host sekaligus resolusi DNS untuk memastikan seluruh alamat hasil resolusi
+ * merupakan IPv4 privat RFC1918 yang diizinkan, serta mengunci IP tujuan guna mencegah DNS rebinding.
+ */
+export async function resolveAndValidateRouterHost(host: string): Promise<ValidatedRouterTarget> {
+  const cleanHost = validateRouterHost(host);
+
+  if (parseCanonicalIpv4Octets(cleanHost) !== null) {
+    return {
+      host: cleanHost,
+      resolvedIp: cleanHost,
+      allResolvedIps: [cleanHost],
+      isIpLiteral: true,
+    };
+  }
+
+  let records: Array<{ address: string; family: number }>;
+  try {
+    const lookupRes = await dns.promises.lookup(cleanHost, { all: true, verbatim: true });
+    records = Array.isArray(lookupRes) ? lookupRes : [];
+  } catch {
+    throw new SafeOperationalError(
+      'ENOTFOUND',
+      'Hostname router tidak dapat ditemukan melalui resolusi DNS.',
+      { statusCode: 400 }
+    );
+  }
+
+  if (records.length === 0) {
+    throw new SafeOperationalError(
+      'ENOTFOUND',
+      'Hostname router tidak menghasilkan alamat IP yang valid dari DNS.',
+      { statusCode: 400 }
+    );
+  }
+
+  const validatedIps: string[] = [];
+  for (const record of records) {
+    const candidateIp = typeof record?.address === 'string' ? record.address.trim() : '';
+    if (!candidateIp) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Hasil resolusi DNS hostname router mengandung entri kosong yang tidak valid.',
+        { statusCode: 400 }
+      );
+    }
+    if (net.isIPv6(candidateIp)) {
+      const v6Check = classifyIpv6Address(candidateIp);
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        `Hostname router ditolak karena resolusi DNS menghasilkan alamat yang tidak diizinkan (${v6Check.reason}).`,
+        { statusCode: 400 }
+      );
+    }
+    const v4Check = classifyIpv4Address(candidateIp);
+    if (!v4Check.allowed) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        `Hostname router ditolak karena resolusi DNS menghasilkan alamat yang tidak diizinkan (${v4Check.reason}).`,
+        { statusCode: 400 }
+      );
+    }
+    if (!validatedIps.includes(candidateIp)) {
+      validatedIps.push(candidateIp);
+    }
+  }
+
+  return {
+    host: cleanHost,
+    resolvedIp: validatedIps[0],
+    allResolvedIps: validatedIps,
+    isIpLiteral: false,
+  };
+}
+
+function createPinnedSocketLookup(pinnedIpv4: string): net.LookupFunction {
+  return ((
+    _hostname: string,
+    opts: any,
+    cb?: (err: NodeJS.ErrnoException | null, address: string | dns.LookupAddress[], family?: number) => void
+  ) => {
+    const callback = typeof opts === 'function' ? opts : cb;
+    if (!callback) return;
+    if (typeof opts === 'object' && opts !== null && opts.all) {
+      callback(null, [{ address: pinnedIpv4, family: 4 }]);
+    } else {
+      callback(null, pinnedIpv4, 4);
+    }
+  }) as net.LookupFunction;
+}
+
+/**
  * Validasi port API MikroTik.
  * Rentang valid: 1-65535 (standar MikroTik: 8728 untuk API biasa, 8729 untuk API-SSL).
  */
 export function validateRouterPort(port: number | string): number {
-  const num = typeof port === 'string' ? parseInt(port, 10) : port;
-  if (isNaN(num) || num < 1 || num > 65535) {
+  let num: number;
+  if (typeof port === 'number') {
+    num = port;
+  } else if (typeof port === 'string') {
+    const trimmed = port.trim();
+    if (!/^\d{1,5}$/.test(trimmed)) {
+      throw new SafeOperationalError(
+        'VALIDATION_ERROR',
+        'Port API router harus berupa angka bulat antara 1 dan 65535 (default 8728 atau 8729).',
+        { statusCode: 400 }
+      );
+    }
+    num = Number(trimmed);
+  } else {
+    num = NaN;
+  }
+  if (!Number.isInteger(num) || num < 1 || num > 65535) {
     throw new SafeOperationalError(
       'VALIDATION_ERROR',
       'Port API router harus berupa angka antara 1 dan 65535 (default 8728 atau 8729).',
@@ -230,8 +619,11 @@ function extractSentences(buffer: Buffer): { sentences: string[][]; remaining: B
 export async function testMikrotikConnection(
   options: MikrotikConnectionOptions
 ): Promise<MikrotikConnectionResult> {
-  const cleanHost = validateRouterHost(options.host);
   const cleanPort = validateRouterPort(options.port);
+  const resolvedTarget = await resolveAndValidateRouterHost(options.host);
+  const cleanHost = resolvedTarget.host;
+  const connectIp = resolvedTarget.resolvedIp;
+  const pinnedLookup = createPinnedSocketLookup(connectIp);
   const username = options.username ? options.username.trim() : 'admin';
   const password = options.password ?? '';
   const useSsl = Boolean(options.useSsl);
@@ -303,8 +695,10 @@ export async function testMikrotikConnection(
       if (useSsl) {
         socket = tls.connect(
           {
-            host: cleanHost,
+            host: connectIp,
             port: cleanPort,
+            lookup: pinnedLookup,
+            ...(resolvedTarget.isIpLiteral ? {} : { servername: cleanHost }),
             rejectUnauthorized: false, // Mengizinkan self-signed certificate umum pada router MikroTik lokal
             timeout: timeoutMs,
           },
@@ -315,8 +709,10 @@ export async function testMikrotikConnection(
       } else {
         socket = net.connect(
           {
-            host: cleanHost,
+            host: connectIp,
             port: cleanPort,
+            family: 4,
+            lookup: pinnedLookup,
             timeout: timeoutMs,
           },
           () => {
@@ -561,8 +957,11 @@ export async function withRouterOsClient<T>(
   options: MikrotikConnectionOptions,
   action: (talk: (sentence: string[]) => Promise<string[][]>) => Promise<T>
 ): Promise<T> {
-  const cleanHost = validateRouterHost(options.host);
   const cleanPort = validateRouterPort(options.port);
+  const resolvedTarget = await resolveAndValidateRouterHost(options.host);
+  const cleanHost = resolvedTarget.host;
+  const connectIp = resolvedTarget.resolvedIp;
+  const pinnedLookup = createPinnedSocketLookup(connectIp);
   const username = options.username ? options.username.trim() : 'admin';
   const password = options.password ?? '';
   const useSsl = Boolean(options.useSsl);
@@ -653,8 +1052,10 @@ export async function withRouterOsClient<T>(
       if (useSsl) {
         socket = tls.connect(
           {
-            host: cleanHost,
+            host: connectIp,
             port: cleanPort,
+            lookup: pinnedLookup,
+            ...(resolvedTarget.isIpLiteral ? {} : { servername: cleanHost }),
             rejectUnauthorized: false,
             timeout: timeoutMs,
           },
@@ -663,8 +1064,10 @@ export async function withRouterOsClient<T>(
       } else {
         socket = net.connect(
           {
-            host: cleanHost,
+            host: connectIp,
             port: cleanPort,
+            family: 4,
+            lookup: pinnedLookup,
             timeout: timeoutMs,
           },
           () => onConnected()
