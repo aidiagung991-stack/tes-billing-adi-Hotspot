@@ -1,12 +1,8 @@
 import React from 'react';
 import {
   Menu,
-  Bell,
-  Search,
-  User,
-  HelpCircle,
-  Wifi,
   Calendar,
+  LogOut,
 } from 'lucide-react';
 import { MenuItemKey } from '../types/index.ts';
 
@@ -16,6 +12,9 @@ interface HeaderProps {
   searchTerm?: string;
   onSearchChange?: (val: string) => void;
   unpaidCount: number;
+  adminUsername?: string | null;
+  onLogout?: () => void;
+  isLoggingOut?: boolean;
 }
 
 const menuTitles: Record<MenuItemKey, { title: string; subtitle: string }> = {
@@ -64,9 +63,10 @@ const menuTitles: Record<MenuItemKey, { title: string; subtitle: string }> = {
 export const Header: React.FC<HeaderProps> = ({
   activeMenu,
   onOpenMobileMenu,
-  searchTerm,
-  onSearchChange,
   unpaidCount,
+  adminUsername,
+  onLogout,
+  isLoggingOut = false,
 }) => {
   const currentMenu = menuTitles[activeMenu] || {
     title: 'Adi_Hotspot Billing',
@@ -80,6 +80,9 @@ export const Header: React.FC<HeaderProps> = ({
     month: 'long',
     year: 'numeric',
   }).format(new Date());
+
+  const displayUsername = adminUsername && adminUsername.trim() ? adminUsername.trim() : 'Admin';
+  const initials = displayUsername.slice(0, 2).toUpperCase();
 
   return (
     <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200/80 transition-all">
@@ -125,15 +128,27 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           )}
 
-          {/* User profile badge */}
+          {/* User profile badge & Logout */}
           <div className="flex items-center gap-2.5 pl-2 sm:pl-3 sm:border-l sm:border-slate-200">
-            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-700 to-indigo-600 flex items-center justify-center text-white font-semibold text-xs shadow-xs">
-              AD
+            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-700 to-indigo-600 flex items-center justify-center text-white font-semibold text-xs shadow-xs shrink-0">
+              {initials}
             </div>
             <div className="hidden sm:block text-left">
-              <p className="text-xs font-semibold text-slate-800 leading-tight">Adi Kusuma</p>
+              <p className="text-xs font-semibold text-slate-800 leading-tight">{displayUsername}</p>
               <p className="text-[10px] text-slate-500 font-medium">Administrator RT/RW</p>
             </div>
+            {onLogout && (
+              <button
+                type="button"
+                onClick={onLogout}
+                disabled={isLoggingOut}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-red-50 hover:text-red-700 border border-slate-200 hover:border-red-200 whitespace-nowrap shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 disabled:opacity-50 transition-colors cursor-pointer"
+                title="Keluar dari sesi admin"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>{isLoggingOut ? 'Keluar...' : 'Keluar'}</span>
+              </button>
+            )}
           </div>
         </div>
       </div>

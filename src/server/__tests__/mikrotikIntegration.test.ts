@@ -5,10 +5,17 @@ import http from 'node:http';
 import assert from 'node:assert/strict';
 import express from 'express';
 import pg from 'pg';
+import bcrypt from 'bcryptjs';
 
-// Pastikan env tersedia sebelum modul db/crypto dimuat secara dinamis
+// Pastikan env tersedia sebelum modul db/crypto/auth dimuat secara dinamis
+const TEST_ADMIN_USERNAME = 'test_admin_mikrotik';
+const TEST_ADMIN_PASSWORD = 'TestAdminPassword!2026';
 process.env.DB_PASSWORD = process.env.DB_PASSWORD || 'mock_test_db_password';
 process.env.MIKROTIK_ENCRYPTION_KEY = process.env.MIKROTIK_ENCRYPTION_KEY || 'phase1_audit_test_encryption_key_32bytes';
+process.env.ADMIN_USERNAME = TEST_ADMIN_USERNAME;
+process.env.ADMIN_PASSWORD_HASH = bcrypt.hashSync(TEST_ADMIN_PASSWORD, 10);
+process.env.SESSION_SECRET = 'test_session_secret_for_mikrotik_integration_suite_64_chars_long';
+process.env.COOKIE_SECURE = 'false';
 
 interface MockRouterSecret {
   '.id': string;
@@ -582,6 +589,8 @@ class MockPostgresStore {
   packages = new Map<string, MockPackageRow>();
   customers = new Map<string, MockCustomerRow>();
   invoices = new Map<string, any>();
+  adminSessions = new Map<string, { sess: any; expires_at: string }>();
+  adminLoginAttempts = new Map<string, { attempt_count: number; window_started_at: string; locked_until: string | null }>();
   injectErrorOnPattern: { pattern: RegExp; error: any } | null = null;
 
   reset(routerPort: number, routerPasswordEncrypted: string) {
@@ -882,6 +891,55 @@ class MockPostgresStore {
       return { rows: [this.mapReturningRow(row)], rowCount: 1 };
     }
 
+    if (q.startsWith('SELECT sess, expires_at FROM admin_sessions WHERE sid_hash = $1')) {
+      const entry = this.adminSessions.get(params[0]);
+      return { rows: entry ? [{ sess: entry.sess, expires_at: entry.expires_at }] : [], rowCount: entry ? 1 : 0 };
+    }
+
+    if (q.startsWith('INSERT INTO admin_sessions')) {
+      const sessObj = typeof params[1] === 'string' ? JSON.parse(params[1]) : params[1];
+      this.adminSessions.set(params[0], { sess: sessObj, expires_at: String(params[2]) });
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (q.startsWith('DELETE FROM admin_sessions WHERE sid_hash = $1')) {
+      const existed = this.adminSessions.delete(params[0]);
+      return { rows: [], rowCount: existed ? 1 : 0 };
+    }
+
+    if (q.startsWith('DELETE FROM admin_sessions WHERE expires_at <=')) {
+      const now = Date.now();
+      for (const [k, v] of this.adminSessions.entries()) {
+        if (new Date(v.expires_at).getTime() <= now) {
+          this.adminSessions.delete(k);
+        }
+      }
+      return { rows: [], rowCount: 0 };
+    }
+
+    if (q.startsWith('UPDATE admin_sessions SET updated_at')) {
+      return { rows: [], rowCount: this.adminSessions.has(params[0]) ? 1 : 0 };
+    }
+
+    if (q.startsWith('SELECT attempt_count, window_started_at, locked_until FROM admin_login_attempts WHERE rate_key = $1')) {
+      const entry = this.adminLoginAttempts.get(params[0]);
+      return { rows: entry ? [{ ...entry }] : [], rowCount: entry ? 1 : 0 };
+    }
+
+    if (q.startsWith('INSERT INTO admin_login_attempts')) {
+      this.adminLoginAttempts.set(params[0], {
+        attempt_count: Number(params[1]),
+        window_started_at: String(params[2]),
+        locked_until: params[3] ? String(params[3]) : null,
+      });
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (q.startsWith('DELETE FROM admin_login_attempts WHERE rate_key = $1')) {
+      this.adminLoginAttempts.delete(params[0]);
+      return { rows: [], rowCount: 1 };
+    }
+
     throw new Error(`Unhandled SQL in MockPostgresStore: ${q}`);
   }
 }
@@ -1014,6 +1072,7 @@ async function main() {
     logSafeServerError,
   } = await import('../errorSanitizer.js');
   const dbRoutesModule = await import('../dbRoutes.js');
+  const { adminSessionMiddleware, createAuthRouter } = await import('../auth.js');
   const {
     parsePendingSyncActions,
     mergeOldAccounts,
@@ -1029,6 +1088,7 @@ async function main() {
 
   const app = express();
   app.use(express.json());
+  app.use('/api', adminSessionMiddleware, createAuthRouter());
   app.use('/api', dbRoutesModule.default);
 
   const httpServer = http.createServer(app);
@@ -1037,10 +1097,43 @@ async function main() {
   ignoredTestHttpPorts.add(httpPort);
   const baseUrl = `http://127.0.0.1:${httpPort}/api`;
 
+  async function loginSessionFor(targetBaseUrl: string, targetOrigin: string): Promise<{ cookie: string; csrfToken: string }> {
+    const loginRes = await fetch(`${targetBaseUrl}/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: targetOrigin,
+      },
+      body: JSON.stringify({
+        username: TEST_ADMIN_USERNAME,
+        password: TEST_ADMIN_PASSWORD,
+      }),
+    });
+    const loginJson: any = await loginRes.json();
+    assert.equal(loginRes.status, 200, `Test harness login failed: ${JSON.stringify(loginJson)}`);
+    const setCookies = typeof loginRes.headers.getSetCookie === 'function'
+      ? loginRes.headers.getSetCookie()
+      : [loginRes.headers.get('set-cookie') || ''];
+    const cookiePair = setCookies
+      .map((c) => c.split(';')[0])
+      .filter(Boolean)
+      .join('; ');
+    assert.ok(cookiePair.includes('adi_hotspot_sid='), 'Test harness missing session cookie');
+    assert.ok(loginJson.csrfToken, 'Test harness missing csrfToken');
+    return { cookie: cookiePair, csrfToken: loginJson.csrfToken };
+  }
+
+  const mainAuth = await loginSessionFor(baseUrl, `http://127.0.0.1:${httpPort}`);
+
   async function api(method: string, path: string, body?: any): Promise<{ status: number; json: any; rawText: string }> {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: `http://127.0.0.1:${httpPort}`,
+        Cookie: mainAuth.cookie,
+        'X-CSRF-Token': mainAuth.csrfToken,
+      },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     const rawText = await res.text();
@@ -2402,17 +2495,24 @@ async function main() {
 
     const injectedApp = express();
     injectedApp.use(express.json());
+    injectedApp.use('/api', adminSessionMiddleware, createAuthRouter());
     injectedApp.use('/api', injectedRouter);
     const injectedServer = http.createServer(injectedApp);
     await new Promise<void>((resolve) => injectedServer.listen(0, '127.0.0.1', () => resolve()));
     const injectedHttpPort = (injectedServer.address() as net.AddressInfo).port;
     ignoredTestHttpPorts.add(injectedHttpPort);
     const injectedBase = `http://127.0.0.1:${injectedHttpPort}/api`;
+    const injectedAuth = await loginSessionFor(injectedBase, `http://127.0.0.1:${injectedHttpPort}`);
 
     const apiInjected = async (method: string, path: string, body?: any) => {
       const res = await fetch(`${injectedBase}${path}`, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: `http://127.0.0.1:${injectedHttpPort}`,
+          Cookie: injectedAuth.cookie,
+          'X-CSRF-Token': injectedAuth.csrfToken,
+        },
         body: body ? JSON.stringify(body) : undefined,
       });
       const rawText = await res.text();

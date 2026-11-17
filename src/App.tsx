@@ -17,6 +17,7 @@ import { computeInvoiceStatus } from './utils/invoiceStorage.ts';
 import { generateUniqueTransactionNumber } from './utils/paymentStorage.ts';
 import { Sidebar } from './components/Sidebar.tsx';
 import { Header } from './components/Header.tsx';
+import { LoginPage } from './components/LoginPage.tsx';
 import { SampleDataBanner } from './components/SampleDataBanner.tsx';
 import { WhatsappReminderModal } from './components/WhatsappReminderModal.tsx';
 import { DashboardView } from './pages/DashboardView.tsx';
@@ -57,10 +58,21 @@ import {
   saveWAScheduleToApi,
   recordWALogToApi,
   fetchMikrotikConfigFromApi,
+  checkAuthSession,
+  loginAdminApi,
+  logoutAdminApi,
+  setUnauthorizedHandler,
   DbStatusResponse,
 } from './services/apiService.ts';
 
 export default function App() {
+  const [authChecking, setAuthChecking] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authConfigured, setAuthConfigured] = useState(true);
+  const [adminUsername, setAdminUsername] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+
   const [activeMenu, setActiveMenu] = useState<MenuItemKey>('dashboard');
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
@@ -83,8 +95,67 @@ export default function App() {
   // WhatsApp Reminder Modal state
   const [reminderInvoice, setReminderInvoice] = useState<Invoice | null>(null);
 
-  // Inisialisasi dan sinkronisasi data dari PostgreSQL backend saat aplikasi dibuka
+  const clearOperationalState = () => {
+    setDbStatus(null);
+    setDbError(null);
+    setCustomers([]);
+    setPackages([]);
+    setInvoices([]);
+    setPayments([]);
+    setRouterConfig(initialRouterConfig);
+    setSettings(initialBusinessSettings);
+    setReminderInvoice(null);
+    setIsMobileMenuOpen(false);
+    setActiveMenu('dashboard');
+  };
+
+  // 1. Cek status session saat aplikasi dibuka & pasang handler HTTP 401
   useEffect(() => {
+    let isMounted = true;
+
+    setUnauthorizedHandler(() => {
+      if (!isMounted) return;
+      clearOperationalState();
+      setIsAuthenticated(false);
+      setAdminUsername(null);
+      setAuthNotice('Sesi admin telah berakhir atau tidak valid. Silakan login kembali.');
+    });
+
+    async function verifySessionOnMount() {
+      try {
+        const sessionStatus = await checkAuthSession();
+        if (!isMounted) return;
+        setAuthConfigured(sessionStatus.authConfigured);
+        if (sessionStatus.authenticated) {
+          setIsAuthenticated(true);
+          setAdminUsername(sessionStatus.username);
+          setAuthNotice(null);
+        } else {
+          clearOperationalState();
+          setIsAuthenticated(false);
+          setAdminUsername(null);
+        }
+      } finally {
+        if (isMounted) {
+          setAuthChecking(false);
+        }
+      }
+    }
+
+    verifySessionOnMount();
+
+    return () => {
+      isMounted = false;
+      setUnauthorizedHandler(null);
+    };
+  }, []);
+
+  // 2. Sinkronisasi data operasional dari PostgreSQL HANYA setelah session admin tervalidasi
+  useEffect(() => {
+    if (!isAuthenticated) {
+      return;
+    }
+
     let isMounted = true;
 
     async function syncDataFromPostgres() {
@@ -161,7 +232,35 @@ export default function App() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [isAuthenticated]);
+
+  const handleLogin = async (username: string, password: string): Promise<{ success: boolean; message?: string }> => {
+    const res = await loginAdminApi(username, password);
+    if (res.success && res.authenticated) {
+      setAuthNotice(null);
+      setAdminUsername(res.username || username);
+      setIsAuthenticated(true);
+      return { success: true };
+    }
+    return {
+      success: false,
+      message: res.message || 'Username atau password tidak valid.',
+    };
+  };
+
+  const handleLogout = async () => {
+    if (isLoggingOut) return;
+    setIsLoggingOut(true);
+    try {
+      await logoutAdminApi();
+    } finally {
+      clearOperationalState();
+      setIsAuthenticated(false);
+      setAdminUsername(null);
+      setAuthNotice(null);
+      setIsLoggingOut(false);
+    }
+  };
 
   // Ref untuk mengunci proses transaksi agar tidak terjadi double submit pembayaran
   const isProcessingPaymentRef = useRef(false);
@@ -610,6 +709,28 @@ export default function App() {
     (i) => i.status === 'unpaid' || i.status === 'overdue'
   ).length;
 
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex flex-col items-center justify-center px-4 font-sans antialiased text-slate-700">
+        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm px-6 py-5 text-center max-w-sm w-full">
+          <div className="w-8 h-8 border-2 border-slate-300 border-t-slate-900 rounded-full animate-spin mx-auto mb-3" />
+          <p className="text-sm font-semibold text-slate-800">Memeriksa Sesi Administrator...</p>
+          <p className="text-xs text-slate-500 mt-1">Adi_Hotspot Billing</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <LoginPage
+        authConfigured={authConfigured}
+        initialNotice={authNotice}
+        onLogin={handleLogin}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col font-sans antialiased text-slate-800">
       {/* Top Banner (PostgreSQL Status Notice) */}
@@ -635,6 +756,9 @@ export default function App() {
             activeMenu={activeMenu}
             onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
             unpaidCount={unpaidInvoicesCount}
+            adminUsername={adminUsername}
+            onLogout={handleLogout}
+            isLoggingOut={isLoggingOut}
           />
 
           {/* Page Body */}

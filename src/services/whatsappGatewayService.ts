@@ -1,4 +1,5 @@
 import { WhatsAppGatewayConfig } from '../types/index.ts';
+import { apiFetch } from './apiService.ts';
 
 export interface TestConnectionResponse {
   success: boolean;
@@ -46,7 +47,8 @@ async function parseFetchResponseSafely(res: Response): Promise<{ isJson: boolea
  */
 export async function getBackendGatewayConfig(): Promise<WhatsAppGatewayConfig | null> {
   try {
-    const res = await fetch('/api/whatsapp/config', {
+    const res = await apiFetch('/api/whatsapp/config', {
+      method: 'GET',
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) return null;
@@ -70,7 +72,7 @@ export async function saveBackendGatewayConfig(payload: {
   secretKey?: string;
 }): Promise<{ success: boolean; message: string; config?: WhatsAppGatewayConfig }> {
   try {
-    const res = await fetch('/api/whatsapp/config', {
+    const res = await apiFetch('/api/whatsapp/config', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -113,7 +115,7 @@ export async function testBackendGatewayConnection(payload: {
   secretKey?: string;
 }): Promise<TestConnectionResponse> {
   try {
-    const res = await fetch('/api/whatsapp/test-connection', {
+    const res = await apiFetch('/api/whatsapp/test-connection', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -160,7 +162,7 @@ export async function sendBackendTestMessage(payload: {
   messageContent: string;
 }): Promise<SendMessageResponse> {
   try {
-    const res = await fetch('/api/whatsapp/send-test', {
+    const res = await apiFetch('/api/whatsapp/send-test', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -203,7 +205,7 @@ export async function sendBackendBroadcastMessage(payload: {
   customerName?: string;
 }): Promise<SendMessageResponse> {
   try {
-    const res = await fetch('/api/whatsapp/broadcast', {
+    const res = await apiFetch('/api/whatsapp/broadcast', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

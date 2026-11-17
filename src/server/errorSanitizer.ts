@@ -21,6 +21,10 @@ export const ALLOWED_ERROR_CODES = [
   'ENCRYPTION_NOT_CONFIGURED',
   'DECRYPTION_ERROR',
   'AUTH_FAILED',
+  'AUTH_NOT_CONFIGURED',
+  'UNAUTHORIZED',
+  'FORBIDDEN',
+  'RATE_LIMITED',
   'ROUTEROS_AUTH_FAILED',
   'ROUTEROS_FATAL',
   'ROUTEROS_TRAP',
@@ -154,6 +158,7 @@ function getActiveEnvSecrets(): string[] {
     'SESSION_SECRET',
     'API_SECRET',
     'ADMIN_PASSWORD',
+    'ADMIN_PASSWORD_HASH',
   ];
 
   for (const key of explicitKeys) {
@@ -186,8 +191,16 @@ function redactTextSegment(segment: string): string {
     }
   }
 
-  // 2. Redact ciphertext AES-256-GCM enc:v1:...
+  // 2. Redact ciphertext AES-256-GCM enc:v1:... dan hash bcrypt ($2a$/$2b$/$2y$)
   text = text.replace(/enc:v1:[^\s'"`),;\]]+/g, '[REDACTED_CREDENTIAL]');
+  text = text.replace(/\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}/g, '[REDACTED_HASH]');
+
+  // 2b. Redact header Cookie / Set-Cookie & cookie session
+  text = text.replace(
+    /(["']?)(?:set-cookie|cookie)\1\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n;]+(?:;[^\r\n]*)?)/gi,
+    'Cookie: [REDACTED]'
+  );
+  text = text.replace(/\b(?:adi_hotspot_sid|connect\.sid)=[^\s;,'"`}\]]+/gi, 'session=[REDACTED]');
 
   // 3. Redact PostgreSQL connection URI (termasuk username, password, host, query)
   text = text.replace(/postgres(?:ql)?:\/\/[^\s'"`),;\]]+/gi, 'postgresql://[REDACTED]');

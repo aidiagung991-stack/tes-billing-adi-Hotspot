@@ -40,6 +40,7 @@ import {
   toAllowedErrorCode,
   logSafeServerError,
 } from './errorSanitizer.js';
+import { adminSessionMiddleware, requireAdminAuth } from './auth.js';
 
 interface PendingRouterAccount {
   type: 'pppoe' | 'hotspot';
@@ -555,6 +556,10 @@ export function createDbRouter(mikrotikOverrides?: Partial<MikrotikRouteDeps>): 
     ...mikrotikOverrides,
   };
   const router = Router();
+
+  // Proteksi autentikasi admin & CSRF untuk seluruh endpoint pada dbRouter (termasuk /status)
+  router.use(adminSessionMiddleware);
+  router.use(requireAdminAuth);
 
 // ============================================================================
 // 0. HELPER IDENTIFIKASI SCHEMA MIKROTIK (MIGRATION 003) & KREDENSIAL ROUTER

@@ -23,30 +23,161 @@ export interface DbStatusResponse {
   error?: string;
 }
 
+export interface AuthSessionStatus {
+  authenticated: boolean;
+  authConfigured: boolean;
+  username: string | null;
+  expiresAt?: number;
+}
+
+// Disimpan hanya di memori JS (TIDAK pernah di localStorage atau sessionStorage)
+let inMemoryCsrfToken: string | null = null;
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setCsrfToken(token: string | null): void {
+  inMemoryCsrfToken = token && token.trim() ? token.trim() : null;
+}
+
+export function getCsrfToken(): string | null {
+  return inMemoryCsrfToken;
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
+}
+
+const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Wrapper fetch terpusat dengan cookie same-origin, header X-CSRF-Token,
+ * dan penanganan otomatis HTTP 401 session kedaluwarsa.
+ */
+export async function apiFetch(url: string, options?: RequestInit): Promise<Response> {
+  const method = (options?.method || 'GET').toUpperCase();
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...(options?.headers as Record<string, string> | undefined),
+  };
+
+  if (options?.body !== undefined && !headers['Content-Type'] && !headers['content-type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  if (MUTATING_HTTP_METHODS.has(method)) {
+    headers['X-Requested-With'] = 'AdiHotspotClient';
+    if (inMemoryCsrfToken) {
+      headers['X-CSRF-Token'] = inMemoryCsrfToken;
+    }
+  }
+
+  const res = await fetch(url, {
+    ...options,
+    method,
+    credentials: 'same-origin',
+    headers,
+  });
+
+  if (res.status === 401 && !url.startsWith('/api/auth/login') && !url.startsWith('/api/auth/session')) {
+    inMemoryCsrfToken = null;
+    if (unauthorizedHandler) {
+      unauthorizedHandler();
+    }
+  }
+
+  return res;
+}
+
 /**
  * Helper untuk parsing response fetch secara aman
  */
-async function fetchJsonSafely<T>(url: string, options?: RequestInit): Promise<{ success: boolean; data?: T; message?: string }> {
+async function fetchJsonSafely<T>(url: string, options?: RequestInit): Promise<{ success: boolean; data?: T; message?: string; statusCode?: number }> {
   try {
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        ...(options?.headers || {}),
-      },
-    });
+    const res = await apiFetch(url, options);
 
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
-      return { success: false, message: `Server mengembalikan non-JSON (HTTP ${res.status})` };
+      return { success: false, statusCode: res.status, message: `Server mengembalikan non-JSON (HTTP ${res.status})` };
     }
 
     const json = await res.json();
-    return json;
+    return { ...json, statusCode: res.status };
   } catch (err: any) {
     return { success: false, message: err?.message || 'Network error' };
   }
+}
+
+// ============================================================================
+// 0. ADMIN AUTHENTICATION & SESSION API
+// ============================================================================
+export async function checkAuthSession(): Promise<AuthSessionStatus> {
+  try {
+    const res = await apiFetch('/api/auth/session', { method: 'GET' });
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      setCsrfToken(null);
+      return { authenticated: false, authConfigured: true, username: null };
+    }
+    const json = await res.json();
+    if (json && json.authenticated === true && typeof json.csrfToken === 'string') {
+      setCsrfToken(json.csrfToken);
+      return {
+        authenticated: true,
+        authConfigured: json.authConfigured !== false,
+        username: typeof json.username === 'string' ? json.username : null,
+        expiresAt: typeof json.expiresAt === 'number' ? json.expiresAt : undefined,
+      };
+    }
+    setCsrfToken(null);
+    return {
+      authenticated: false,
+      authConfigured: json?.authConfigured !== false,
+      username: null,
+    };
+  } catch {
+    setCsrfToken(null);
+    return { authenticated: false, authConfigured: true, username: null };
+  }
+}
+
+export async function loginAdminApi(
+  username: string,
+  password: string
+): Promise<{ success: boolean; authenticated?: boolean; username?: string; message?: string; statusCode?: number }> {
+  const res = await fetchJsonSafely<{ authenticated?: boolean; username?: string; csrfToken?: string }>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  });
+
+  const anyRes = res as any;
+  if (res.success && anyRes.authenticated === true && typeof anyRes.csrfToken === 'string') {
+    setCsrfToken(anyRes.csrfToken);
+    return {
+      success: true,
+      authenticated: true,
+      username: anyRes.username,
+      statusCode: res.statusCode,
+    };
+  }
+
+  setCsrfToken(null);
+  return {
+    success: false,
+    authenticated: false,
+    message: res.message || 'Username atau password tidak valid.',
+    statusCode: res.statusCode,
+  };
+}
+
+export async function logoutAdminApi(): Promise<{ success: boolean; message?: string }> {
+  const res = await fetchJsonSafely('/api/auth/logout', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+  setCsrfToken(null);
+  return {
+    success: Boolean(res.success),
+    message: res.message,
+  };
 }
 
 // ============================================================================
@@ -347,4 +478,3 @@ export async function testMikrotikConnectionApi(params?: {
     data: res.data,
   };
 }
-
