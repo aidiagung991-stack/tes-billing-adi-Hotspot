@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Radio, Lock, User, Eye, EyeOff, AlertCircle, ShieldCheck } from 'lucide-react';
 
 interface LoginPageProps {
@@ -17,6 +17,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(initialNotice || null);
+
+  useEffect(() => {
+    if (initialNotice) {
+      setErrorMessage(initialNotice);
+    }
+  }, [initialNotice]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

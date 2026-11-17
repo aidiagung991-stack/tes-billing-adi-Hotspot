@@ -413,6 +413,9 @@ async function main() {
       ['POST', '/mikrotik/config'],
       ['POST', '/mikrotik/test-connection'],
       ['GET', '/tidak-ada'],
+      ['POST', '/health'],
+      ['GET', '/auth/login'],
+      ['GET', '/auth/logout'],
     ];
     for (const [method, endpoint] of protectedRoutes) {
       const res = await fetch(`${baseUrl}${endpoint}`, {
@@ -523,6 +526,20 @@ async function main() {
     assert.equal(store.adminSessions.has(expiredHash), true);
     store.adminSessions.delete(expiredHash);
     assert.equal(store.adminSessions.size, 0, 'Session expired yang diakses harus terhapus dari DB');
+
+    // Cookie usang pada GET /api/auth/session harus dibersihkan lewat Set-Cookie
+    const sessCheck = await fetch(`${baseUrl}/auth/session`, {
+      method: 'GET',
+      headers: { Cookie: cookiePair },
+    });
+    assert.equal(sessCheck.status, 200);
+    const sessJson: any = await sessCheck.json();
+    assert.equal(sessJson.authenticated, false);
+    const { rawSetCookies } = extractSidCookiePair(sessCheck);
+    assert.ok(
+      rawSetCookies.some((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`) && /Expires=Thu, 01 Jan 1970/i.test(c)),
+      'Cookie kedaluwarsa pada /api/auth/session harus dibersihkan melalui Set-Cookie'
+    );
 
     activeCookie = '';
     activeCsrf = loginJson.csrfToken;

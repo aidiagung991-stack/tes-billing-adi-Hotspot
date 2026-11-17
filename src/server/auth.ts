@@ -457,16 +457,14 @@ export function requireAdminAuth(req: Request, res: Response, next: NextFunction
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.setHeader('Pragma', 'no-cache');
 
-  // Rute publik minimal (health check minimal & endpoint autentikasi)
+  const method = req.method.toUpperCase();
+
+  // Rute publik minimal (health check minimal & endpoint autentikasi beserta HTTP method yang sesuai)
   if (
-    fullPath === '/api/health' ||
-    relPath === '/health' ||
-    fullPath === '/api/auth/session' ||
-    relPath === '/auth/session' ||
-    fullPath === '/api/auth/login' ||
-    relPath === '/auth/login' ||
-    fullPath === '/api/auth/logout' ||
-    relPath === '/auth/logout'
+    (method === 'GET' && (fullPath === '/api/health' || relPath === '/health')) ||
+    (method === 'GET' && (fullPath === '/api/auth/session' || relPath === '/auth/session')) ||
+    (method === 'POST' && (fullPath === '/api/auth/login' || relPath === '/auth/login')) ||
+    (method === 'POST' && (fullPath === '/api/auth/logout' || relPath === '/auth/logout'))
   ) {
     return next();
   }
@@ -519,8 +517,12 @@ export function createAuthRouter(): express.Router {
     }
 
     if (!isValidAdminSession(req)) {
+      const hasSessionCookie =
+        typeof req.headers.cookie === 'string' && req.headers.cookie.includes(`${SESSION_COOKIE_NAME}=`);
       if (req.session && (req.session.isAdmin || req.session.expiresAt)) {
         req.session.destroy(() => {});
+      }
+      if (hasSessionCookie) {
         res.clearCookie(SESSION_COOKIE_NAME, resolveSessionCookieOptions(req));
       }
       return res.json({
