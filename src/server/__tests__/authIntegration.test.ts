@@ -27,6 +27,7 @@ class MockAuthPostgresStore {
     string,
     { attempt_count: number; window_started_at: string; locked_until: string | null }
   >();
+  loginAttemptUpsertCount = 0;
   customers = [
     {
       id: 'cust-auth-1',
@@ -114,6 +115,30 @@ class MockAuthPostgresStore {
     if (q.startsWith('SELECT attempt_count, window_started_at, locked_until FROM admin_login_attempts WHERE rate_key = $1')) {
       const entry = this.adminLoginAttempts.get(params[0]);
       return { rows: entry ? [{ ...entry }] : [], rowCount: entry ? 1 : 0 };
+    }
+
+    if (q.startsWith('INSERT INTO admin_login_attempts') && q.includes('RETURNING attempt_count, locked_until')) {
+      this.loginAttemptUpsertCount += 1;
+      const rateKey = String(params[0]);
+      const windowMs = Number(params[1]);
+      const maxAttempts = Number(params[2]);
+      const lockoutMs = Number(params[3]);
+      const now = Date.now();
+      const previous = this.adminLoginAttempts.get(rateKey);
+      const previousWindow = previous ? new Date(previous.window_started_at).getTime() : 0;
+      const previousLock = previous?.locked_until ? new Date(previous.locked_until).getTime() : 0;
+      const resetWindow = !previous
+        || (previousLock > 0 && previousLock <= now)
+        || !Number.isFinite(previousWindow)
+        || previousWindow <= now - windowMs;
+      const attemptCount = resetWindow ? 1 : Number(previous!.attempt_count) + 1;
+      const windowStartedAt = resetWindow ? new Date(now).toISOString() : previous!.window_started_at;
+      const lockedUntil = attemptCount >= maxAttempts
+        ? new Date(now + lockoutMs).toISOString()
+        : null;
+      const entry = { attempt_count: attemptCount, window_started_at: windowStartedAt, locked_until: lockedUntil };
+      this.adminLoginAttempts.set(rateKey, entry);
+      return { rows: [{ attempt_count: attemptCount, locked_until: lockedUntil }], rowCount: 1 };
     }
 
     if (q.startsWith('INSERT INTO admin_login_attempts')) {
@@ -842,6 +867,38 @@ async function main() {
       apiService.setUnauthorizedHandler(null);
       apiService.setCsrfToken(null);
     }
+  });
+
+  // Skenario 16: Percobaan gagal bersamaan tetap dihitung secara atomik tanpa lost update.
+  await runScenario(16, 'Rate limiter menghitung login gagal bersamaan tanpa lost update', async () => {
+    store.adminLoginAttempts.clear();
+    store.loginAttemptUpsertCount = 0;
+    const requests = Array.from({ length: 8 }, () => fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: origin,
+      },
+      body: JSON.stringify({ username: TEST_ADMIN_USERNAME, password: 'WrongConcurrentPassword!123' }),
+    }));
+    const responses = await Promise.all(requests);
+    const statuses = responses.map((response) => response.status);
+    const rateLimitedCount = statuses.filter((status) => status === 429).length;
+    const unauthorizedCount = statuses.filter((status) => status === 401).length;
+    assert.equal(unauthorizedCount, 4, 'Empat percobaan pertama seharusnya menerima HTTP 401');
+    assert.equal(rateLimitedCount, 4, 'Percobaan ke-5 dan seterusnya harus menerima HTTP 429');
+    assert.equal(store.adminLoginAttempts.size, 1, 'Harus ada satu counter untuk IP yang sama');
+    const attempt = [...store.adminLoginAttempts.values()][0];
+    assert.ok(
+      attempt.attempt_count >= 5 && attempt.attempt_count <= 8,
+      `Minimal 5 kegagalan awal harus tercatat hingga lockout aktif (aktual: ${attempt.attempt_count})`
+    );
+    assert.equal(
+      attempt.attempt_count,
+      store.loginAttemptUpsertCount,
+      'Seluruh panggilan recordFailedLoginAttempt bersamaan harus tercatat tepat tanpa lost update'
+    );
+    assert.ok(attempt.locked_until, 'Cooldown harus aktif setelah batas lima kegagalan');
   });
 
   await new Promise<void>((resolve) => server.close(() => resolve()));

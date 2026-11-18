@@ -303,51 +303,66 @@ async function checkLoginRateLimit(rateKey: string): Promise<{ blocked: boolean;
 }
 
 async function recordFailedLoginAttempt(rateKey: string): Promise<{ locked: boolean; retryAfterSeconds: number }> {
-  const res = await query<{
+  // Satu UPSERT atomik: PostgreSQL mengunci baris konflik sehingga dua login
+  // bersamaan tidak dapat membaca hitungan lama lalu saling menimpa.
+  // Waktu dihitung oleh database agar seluruh instance aplikasi memakai jam yang sama.
+  const result = await query<{
     attempt_count: number;
-    window_started_at: string | Date;
     locked_until: string | Date | null;
   }>(
-    'SELECT attempt_count, window_started_at, locked_until FROM admin_login_attempts WHERE rate_key = $1 LIMIT 1',
-    [rateKey]
-  );
-
-  const now = Date.now();
-  let nextCount = 1;
-  let windowStartIso = new Date(now).toISOString();
-
-  if (res.rows && res.rows.length > 0) {
-    const row = res.rows[0];
-    const prevWindowStart = new Date(row.window_started_at).getTime();
-    const prevLockedUntil = row.locked_until ? new Date(row.locked_until).getTime() : 0;
-    const withinWindow = Number.isFinite(prevWindowStart) && now - prevWindowStart <= LOGIN_WINDOW_MS;
-    const cooldownExpired = prevLockedUntil > 0 && prevLockedUntil <= now;
-
-    if (withinWindow && !cooldownExpired) {
-      nextCount = Number(row.attempt_count || 0) + 1;
-      windowStartIso = new Date(prevWindowStart).toISOString();
-    }
-  }
-
-  const shouldLock = nextCount >= LOGIN_MAX_FAILED_ATTEMPTS;
-  const lockedUntilIso = shouldLock ? new Date(now + LOGIN_LOCKOUT_MS).toISOString() : null;
-
-  await query(
     `
-    INSERT INTO admin_login_attempts (rate_key, attempt_count, window_started_at, locked_until, updated_at)
-    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+    INSERT INTO admin_login_attempts (
+      rate_key, attempt_count, window_started_at, locked_until, updated_at
+    )
+    VALUES ($1, 1, clock_timestamp(), NULL, clock_timestamp())
     ON CONFLICT (rate_key) DO UPDATE SET
-      attempt_count = EXCLUDED.attempt_count,
-      window_started_at = EXCLUDED.window_started_at,
-      locked_until = EXCLUDED.locked_until,
-      updated_at = CURRENT_TIMESTAMP
+      attempt_count = CASE
+        WHEN (
+          admin_login_attempts.locked_until IS NOT NULL
+          AND admin_login_attempts.locked_until <= clock_timestamp()
+        ) OR admin_login_attempts.window_started_at <=
+          clock_timestamp() - ($2::integer * INTERVAL '1 millisecond')
+        THEN 1
+        ELSE admin_login_attempts.attempt_count + 1
+      END,
+      window_started_at = CASE
+        WHEN (
+          admin_login_attempts.locked_until IS NOT NULL
+          AND admin_login_attempts.locked_until <= clock_timestamp()
+        ) OR admin_login_attempts.window_started_at <=
+          clock_timestamp() - ($2::integer * INTERVAL '1 millisecond')
+        THEN clock_timestamp()
+        ELSE admin_login_attempts.window_started_at
+      END,
+      locked_until = CASE
+        WHEN (
+          CASE
+            WHEN (
+              admin_login_attempts.locked_until IS NOT NULL
+              AND admin_login_attempts.locked_until <= clock_timestamp()
+            ) OR admin_login_attempts.window_started_at <=
+              clock_timestamp() - ($2::integer * INTERVAL '1 millisecond')
+            THEN 1
+            ELSE admin_login_attempts.attempt_count + 1
+          END
+        ) >= $3::integer
+        THEN clock_timestamp() + ($4::integer * INTERVAL '1 millisecond')
+        ELSE NULL
+      END,
+      updated_at = clock_timestamp()
+    RETURNING attempt_count, locked_until
     `,
-    [rateKey, nextCount, windowStartIso, lockedUntilIso]
+    [rateKey, LOGIN_WINDOW_MS, LOGIN_MAX_FAILED_ATTEMPTS, LOGIN_LOCKOUT_MS]
   );
+
+  const lockedUntilMs = result.rows?.[0]?.locked_until
+    ? new Date(result.rows[0].locked_until).getTime()
+    : 0;
+  const locked = Number.isFinite(lockedUntilMs) && lockedUntilMs > Date.now();
 
   return {
-    locked: shouldLock,
-    retryAfterSeconds: shouldLock ? Math.ceil(LOGIN_LOCKOUT_MS / 1000) : 0,
+    locked,
+    retryAfterSeconds: locked ? Math.max(1, Math.ceil((lockedUntilMs - Date.now()) / 1000)) : 0,
   };
 }
 

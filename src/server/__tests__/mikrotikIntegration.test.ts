@@ -926,6 +926,29 @@ class MockPostgresStore {
       return { rows: entry ? [{ ...entry }] : [], rowCount: entry ? 1 : 0 };
     }
 
+    if (q.startsWith('INSERT INTO admin_login_attempts') && q.includes('RETURNING attempt_count, locked_until')) {
+      const rateKey = String(params[0]);
+      const windowMs = Number(params[1]);
+      const maxAttempts = Number(params[2]);
+      const lockoutMs = Number(params[3]);
+      const now = Date.now();
+      const previous = this.adminLoginAttempts.get(rateKey);
+      const previousWindow = previous ? new Date(previous.window_started_at).getTime() : 0;
+      const previousLock = previous?.locked_until ? new Date(previous.locked_until).getTime() : 0;
+      const resetWindow = !previous
+        || (previousLock > 0 && previousLock <= now)
+        || !Number.isFinite(previousWindow)
+        || previousWindow <= now - windowMs;
+      const attemptCount = resetWindow ? 1 : Number(previous!.attempt_count) + 1;
+      const windowStartedAt = resetWindow ? new Date(now).toISOString() : previous!.window_started_at;
+      const lockedUntil = attemptCount >= maxAttempts
+        ? new Date(now + lockoutMs).toISOString()
+        : null;
+      const entry = { attempt_count: attemptCount, window_started_at: windowStartedAt, locked_until: lockedUntil };
+      this.adminLoginAttempts.set(rateKey, entry);
+      return { rows: [{ attempt_count: attemptCount, locked_until: lockedUntil }], rowCount: 1 };
+    }
+
     if (q.startsWith('INSERT INTO admin_login_attempts')) {
       this.adminLoginAttempts.set(params[0], {
         attempt_count: Number(params[1]),

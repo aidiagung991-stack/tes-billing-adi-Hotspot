@@ -35,9 +35,9 @@ npm run build
 
 Jika `npm run lint` dan `npm run build` berhasil, baru lanjut ke pengujian runtime. Jangan jalankan `npm run migrate` pada tahap ini.
 
-## Yang tidak dilakukan
+## Yang tidak dilakukan (pada fase integrasi PostgreSQL WhatsApp awal)
 
-- Tidak menambahkan login admin, sesuai keputusan pemilik.
+- Pada fase awal tersebut belum ditambahkan login admin; **status saat ini sudah diperbarui dengan autentikasi Single Admin penuh** (lihat `README.md`, `src/server/auth.ts`, dan `migrations/004_admin_auth.sql`).
 - Tidak mengubah file SQL migration.
 - Tidak menjalankan migration atau query ke PostgreSQL.
 - Tidak mengubah atau menghapus tabel `test_koneksi`.
@@ -48,4 +48,4 @@ Jika `npm run lint` dan `npm run build` berhasil, baru lanjut ke pengujian runti
 
 - API riwayat pesan menampilkan 200 pesan terbaru; seluruh catatan tetap tersimpan di PostgreSQL.
 - API riwayat broadcast menampilkan 100 kampanye terbaru.
-- Aplikasi tanpa login harus dibatasi di LAN tepercaya. Jangan membuka port 3000 ke internet publik; akses dari luar lokasi harus melalui VPN.
+- Aplikasi kini dilindungi autentikasi Single Admin dan proteksi CSRF untuk seluruh endpoint `/api/*` operasional; tetap disarankan membatasi port 3000 di firewall LAN atau menggunakan reverse proxy HTTPS (`TRUST_PROXY="loopback"`).

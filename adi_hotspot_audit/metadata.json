@@ -1,6 +1,0 @@
-{
-  "name": "Adi_Hotspot Billing",
-  "description": "Aplikasi administrasi dan penagihan untuk usaha RT/RW Net di Indonesia.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
